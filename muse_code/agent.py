@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 import anthropic
@@ -15,6 +17,7 @@ from .tools import (
     get_active_tool_definitions
 )
 from .prompt import build_system_prompt
+from .session import save_session, new_session_id
 
 def _is_retryable(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
@@ -50,12 +53,36 @@ def _to_openai_tools(tools: list[dict]) -> list[dict]:
 
 
 class Agent:
-    def __init__(self, ui: UI, custom_system_prompt: str | None = None):
+    def __init__(
+        self,
+        ui: UI,
+        permission_mode: str = "default",
+        model: str | None = None,
+        thinking: bool = False,
+        max_cost_usd: float | None = None,
+        max_turns: int | None = None,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        anthropic_base_url: str | None = None,
+        custom_system_prompt: str | None = None,
+    ):
         self.ui = ui
-        self.permission_mode = "default"
+        self.permission_mode = permission_mode
+        self.thinking = thinking
+        self.max_cost_usd = max_cost_usd
+        self.max_turns = max_turns
         self._aborted = False
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
-        
+
+        # 会话追踪
+        self._session_id = new_session_id()
+        self._session_start = datetime.now(timezone.utc).isoformat()
+        self._turn_count = 0
+        self._cost_usd = 0.0
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+
+        # 自动判断后端
         backend = os.getenv("MUSE_BACKEND", "openai").lower()
         self.use_openai = (backend != "anthropic")
 
@@ -63,29 +90,180 @@ class Agent:
         self._read_file_state: dict[str, float] = {}
 
         if self.use_openai:
-            api_key = os.getenv("OPENAI_API_KEY", "sk-da55231cfba049438b776410797e5032")
-            base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com")
-            self.model = os.getenv("OPENAI_MODEL", "deepseek-v4-flash")
-            self._openai_client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+            resolved_key = api_key or os.getenv("OPENAI_API_KEY", "sk-da55231cfba049438b776410797e5032")
+            resolved_base = api_base or os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com")
+            self.model = model or os.getenv("OPENAI_MODEL", "deepseek-v4-flash")
+            self._openai_client = openai.AsyncOpenAI(api_key=resolved_key, base_url=resolved_base)
             self._anthropic_client = None
             self._openai_messages = [{"role": "system", "content": self._base_system_prompt}]
         else:
-            api_key = os.getenv("ANTHROPIC_API_KEY")
-            self.model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
-            self._anthropic_client = anthropic.AsyncAnthropic(api_key=api_key)
+            resolved_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+            self.model = model or os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+            kwargs: dict[str, Any] = {}
+            if api_key:
+                kwargs["api_key"] = api_key
+            if anthropic_base_url:
+                kwargs["base_url"] = anthropic_base_url
+            self._anthropic_client = anthropic.AsyncAnthropic(**kwargs)
             self._openai_client = None
             self._anthropic_messages = []
             self._system_prompt = self._base_system_prompt
 
+        # 计划模式状态
+        self._pre_plan_mode: str | None = None
+        self._plan_file_path: str | None = None
+
     def abort(self) -> None:
         self._aborted = True
 
+    def restore_session(self, session: dict[str, Any]) -> None:
+        """从保存的会话数据恢复消息历史"""
+        meta = session.get("metadata", {})
+        self._session_id = meta.get("id", self._session_id)
+        self._session_start = meta.get("startTime", self._session_start)
+        self._cost_usd = meta.get("costUsd", 0.0)
+        self._turn_count = meta.get("turnCount", 0)
+
+        if self.use_openai:
+            self._openai_messages = session.get("openaiMessages", self._openai_messages)
+        else:
+            self._anthropic_messages = session.get("anthropicMessages", self._anthropic_messages)
+
+    def clear_history(self) -> None:
+        """清空对话历史，保留系统提示"""
+        if self.use_openai:
+            self._openai_messages = [{"role": "system", "content": self._base_system_prompt}]
+        else:
+            self._anthropic_messages = []
+        self._turn_count = 0
+        self.ui.print_system("对话历史已清空")
+
+    def show_cost(self) -> None:
+        """显示当前会话的用量统计"""
+        cost = self._get_current_cost_usd()
+        budget_info = f" / ${self.max_cost_usd} 预算" if self.max_cost_usd else ""
+        turn_info = f" | 轮次: {self._turn_count}/{self.max_turns}" if self.max_turns else ""
+        msg_count = len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
+        self.ui.print_system(
+            f"Token: {self._total_input_tokens} in / {self._total_output_tokens} out\n"
+            f"消息数: {msg_count}\n"
+            f"预估费用: ${cost:.4f}{budget_info}{turn_info}"
+        )
+
+    def _get_current_cost_usd(self) -> float:
+        """估算当前费用（基于 token 用量）"""
+        return (self._total_input_tokens / 1_000_000) * 3 + (self._total_output_tokens / 1_000_000) * 15
+
+    def _check_budget(self) -> dict:
+        """检查是否超出预算或轮次限制"""
+        if self.max_cost_usd is not None and self._get_current_cost_usd() >= self.max_cost_usd:
+            return {"exceeded": True, "reason": f"费用已达上限 (${self._get_current_cost_usd():.4f} >= ${self.max_cost_usd})"}
+        if self.max_turns is not None and self._turn_count >= self.max_turns:
+            return {"exceeded": True, "reason": f"轮次已达上限 ({self._turn_count} >= {self.max_turns})"}
+        return {"exceeded": False}
+
+    async def compact(self) -> None:
+        """压缩对话历史：保留系统提示 + 最近 4 条消息"""
+        if self.use_openai:
+            if len(self._openai_messages) > 5:
+                system = self._openai_messages[0]
+                self._openai_messages = [system] + self._openai_messages[-4:]
+                self.ui.print_system("对话已压缩")
+            else:
+                self.ui.print_system("对话较短，无需压缩")
+        else:
+            if len(self._anthropic_messages) > 4:
+                self._anthropic_messages = self._anthropic_messages[-4:]
+                self.ui.print_system("对话已压缩")
+            else:
+                self.ui.print_system("对话较短，无需压缩")
+
+    def toggle_plan_mode(self) -> str:
+        """切换计划模式（只读），返回当前权限模式"""
+        if self.permission_mode == "plan":
+            # 退出计划模式，恢复之前的权限模式
+            self.permission_mode = self._pre_plan_mode or "default"
+            self._pre_plan_mode = None
+            self._plan_file_path = None
+            self._system_prompt = self._base_system_prompt
+            if self.use_openai and self._openai_messages:
+                self._openai_messages[0]["content"] = self._system_prompt
+            self.ui.print_system(f"已退出计划模式 → {self.permission_mode} 模式")
+            return self.permission_mode
+        else:
+            # 进入计划模式，保存当前权限模式
+            self._pre_plan_mode = self.permission_mode
+            self.permission_mode = "plan"
+            self._plan_file_path = self._generate_plan_file_path()
+            self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
+            if self.use_openai and self._openai_messages:
+                self._openai_messages[0]["content"] = self._system_prompt
+            self.ui.print_system(f"已进入计划模式。计划文件: {self._plan_file_path}")
+            return "plan"
+
+    def _generate_plan_file_path(self) -> str:
+        """生成计划文件路径"""
+        d = Path.home() / ".muse" / "plans"
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d / f"plan-{self._session_id}.md")
+
+    def _build_plan_mode_prompt(self) -> str:
+        """构建计划模式的附加系统提示"""
+        return f"""
+
+# Plan Mode Active
+
+Plan mode is active. You MUST NOT make any edits (except the plan file below), run non-readonly tools, or make any changes to the system.
+
+## Plan File: {self._plan_file_path}
+Write your plan incrementally to this file using write_file or edit_file. This is the ONLY file you are allowed to edit.
+
+## Workflow
+1. **Explore**: Read code to understand the task. Use read_file, list_files, grep_search.
+2. **Design**: Design your implementation approach. Use the agent tool with type="plan" if the task is complex.
+3. **Write Plan**: Write a structured plan to the plan file including:
+   - **Context**: Why this change is needed
+   - **Steps**: Implementation steps with critical file paths
+   - **Verification**: How to test the changes
+4. **Exit**: Call exit_plan_mode when your plan is ready for user review.
+
+IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask the user to approve — exit_plan_mode handles that."""
+
+    def _auto_save(self) -> None:
+        """自动保存会话到磁盘"""
+        data: dict[str, Any] = {
+            "metadata": {
+                "id": self._session_id,
+                "model": self.model,
+                "cwd": os.getcwd(),
+                "startTime": self._session_start,
+                "turnCount": self._turn_count,
+                "costUsd": self._cost_usd,
+            },
+        }
+        if self.use_openai:
+            data["openaiMessages"] = self._openai_messages
+        else:
+            data["anthropicMessages"] = self._anthropic_messages
+        save_session(self._session_id, data)
+
     async def run(self, user_message: str) -> None:
         self._aborted = False
-        if self.use_openai:
-            await self._chat_openai(user_message)
-        else:
-            await self._chat_anthropic(user_message)
+        self._turn_count += 1
+
+        # 检查预算和轮次限制
+        budget = self._check_budget()
+        if budget["exceeded"]:
+            self.ui.print_system(budget["reason"])
+            return
+
+        try:
+            if self.use_openai:
+                await self._chat_openai(user_message)
+            else:
+                await self._chat_anthropic(user_message)
+        finally:
+            self._auto_save()
 
     # ─── Anthropic backend ───────────────────────────────────────
 

@@ -3,13 +3,75 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.markdown import Markdown
 
+
+# 工具图标映射
+_TOOL_ICONS: dict[str, str] = {
+    "read_file": "📖",
+    "edit_file": "✏️",
+    "write_file": "📝",
+    "list_files": "📂",
+    "grep_search": "🔍",
+    "run_shell": "⚡",
+    "web_fetch": "🌐",
+    "tool_search": "🔎",
+    "agent": "🤖",
+    "skill": "🎯",
+    "enter_plan_mode": "📋",
+    "exit_plan_mode": "📋",
+}
+
+
+def _get_tool_icon(name: str) -> str:
+    return _TOOL_ICONS.get(name, "🛠️")
+
+
+def _get_tool_summary(name: str, inp: dict | str) -> str:
+    """生成工具调用的简短摘要"""
+    if isinstance(inp, str):
+        try:
+            import json
+            inp = json.loads(inp)
+        except Exception:
+            return inp[:60]
+
+    if name == "read_file":
+        path = inp.get("file_path", "")
+        return path.split("/")[-1] if path else ""
+    if name == "write_file":
+        path = inp.get("file_path", "")
+        return path.split("/")[-1] if path else ""
+    if name == "edit_file":
+        path = inp.get("file_path", "")
+        old = inp.get("old_string", "")
+        preview = old[:30].replace("\n", " ") if old else ""
+        return f"{path.split('/')[-1]}: '{preview}...'" if path else ""
+    if name == "list_files":
+        pattern = inp.get("pattern", "")
+        return pattern
+    if name == "grep_search":
+        pattern = inp.get("pattern", "")
+        return pattern
+    if name == "run_shell":
+        cmd = inp.get("command", "")
+        return cmd[:50] if cmd else ""
+    if name == "web_fetch":
+        url = inp.get("url", "")
+        return url[:50] if url else ""
+    if name == "tool_search":
+        query = inp.get("query", "")
+        return query
+    return ""
+
+
 class UI:
     def __init__(self):
         self.console = Console()
 
     def print_welcome(self):
         self.console.print(Panel.fit(
-            "[bold blue]Welcome to Muse Code MVP[/bold blue]\nType 'exit' to quit.",
+            "[bold blue]Welcome to Muse Code[/bold blue]\n"
+            "输入消息开始对话，输入 exit 退出\n"
+            "命令: /clear /cost /compact /plan",
             border_style="blue"
         ))
 
@@ -25,12 +87,19 @@ class UI:
         ))
 
     def print_tool_call(self, tool_name: str, args: str):
-        self.console.print(f"[dim yellow]🛠️  Calling Tool: {tool_name} with {args}[/dim yellow]")
-        
+        icon = _get_tool_icon(tool_name)
+        summary = _get_tool_summary(tool_name, args)
+        self.console.print(f"\n  [yellow]{icon} {tool_name}[/yellow][dim] {summary}[/dim]")
+
     def print_tool_result(self, result: str):
-        # Truncate long results for display
-        display_result = result if len(result) < 500 else result[:500] + "... [truncated]"
-        self.console.print(f"[dim cyan]🔧 Tool Result:[/dim cyan] {display_result}")
+        # 截断长结果用于显示
+        max_len = 500
+        if len(result) > max_len:
+            display = result[:max_len] + f"\n  ... ({len(result)} chars total)"
+        else:
+            display = result
+        lines = "\n".join("  " + l for l in display.split("\n"))
+        self.console.print(f"[dim]{lines}[/dim]")
 
     def print_system(self, message: str):
         self.console.print(f"[bold yellow]{message}[/bold yellow]")

@@ -277,4 +277,58 @@
 - Git 上下文自动获取：当前分支、最近 5 条 commit、工作区状态
 - Agent 构造函数支持 `custom_system_prompt` 参数，可覆盖默认生成的提示
 
+## （4）feat：添加命令行参数体系、REPL 交互循环、会话持久化
+
+**核心内容**：从简单的主循环升级为完整的 CLI 工具，支持命令行参数、权限模式切换、会话保存/恢复、预算控制等。
+
+#### 1. 命令行参数体系
+
+| 参数 | 说明 |
+|------|------|
+| `--yolo, -y` | 跳过所有确认，自动执行（bypassPermissions 模式） |
+| `--plan` | 计划模式（只读，不修改文件） |
+| `--accept-edits` | 自动接受文件编辑 |
+| `--dont-ask` | 尽量不向用户提问（CI 场景） |
+| `--thinking` | 启用扩展思考模式 |
+| `--model, -m` | 指定模型名称 |
+| `--api-base` | 自定义 API 基地址 |
+| `--resume` | 恢复上一次会话 |
+| `--max-cost` | 最大费用限制（USD） |
+| `--max-turns` | 最大对话轮次 |
+
+通过 `_resolve_permission_mode()` 将参数映射为 5 种权限模式：`default`、`bypassPermissions`、`plan`、`acceptEdits`、`dontAsk`。
+
+#### 2. REPL 交互循环
+
+- 支持 SIGINT 双击退出（第一次中断当前操作，第二次退出程序）
+- 内置 REPL 命令：`/clear`（清空历史）、`/cost`（显示用量）、`/compact`（压缩对话）、`/plan`（切换计划模式）
+- 支持单次提示词模式（`muse "fix the bug"`）和交互模式（`muse`）
+
+#### 3. 会话持久化
+
+- 每轮对话后自动保存到 `~/.muse/sessions/{session_id}.json`
+- 保存内容：metadata（id、model、cwd、startTime、turnCount、costUsd）+ 消息历史
+- `--resume` 参数恢复最近一次会话，继续之前的对话
+
+#### 4. 预算控制
+
+- `_check_budget()` 在每轮对话前检查费用和轮次是否超限
+- `_get_current_cost_usd()` 基于 token 用量估算费用（input $3/M, output $15/M）
+- `show_cost()` 显示 token 数、预估费用、预算上限、轮次上限
+
+#### 5. 计划模式增强
+
+- 进入计划模式时保存之前的权限模式（`_pre_plan_mode`），退出时恢复
+- 动态修改系统提示：进入时追加计划模式提示词，退出时还原
+- OpenAI 后端同步更新 `_openai_messages[0]` 的系统消息
+- 计划文件生成到 `~/.muse/plans/plan-{session_id}.md`
+- 计划模式提示词包含 Explore → Design → Write Plan → Exit 工作流
+
+#### 6. UI 增强
+
+- 工具图标映射（`_TOOL_ICONS`）：每个工具有专属 emoji
+- 工具调用摘要（`_get_tool_summary`）：根据工具类型生成简短描述（如 `read_file` 只显示文件名）
+- 工具结果截断显示（500 字符上限）
+
+
 ---
