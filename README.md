@@ -11,9 +11,14 @@
 ### 1. 配置环境变量（可选，按需设置 OpenAI 兼容接口）
 
 ```bash
+export MUSE_BACKEND="openai" # 默认使用 openai 即 OpenAI Compatible 模式
 export OPENAI_API_KEY="sk-da55231cfba049438b776410797e5032"
 export OPENAI_BASE_URL="https://api.deepseek.com"
 export OPENAI_MODEL="deepseek-v4-flash"
+
+# 或者若想使用 Anthropic 原生支持：
+# export MUSE_BACKEND="anthropic"
+# export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
 ### 2. 开发模式（需在项目目录下执行，始终使用最新代码）
