@@ -167,3 +167,114 @@
 - [ ] **截断上限可配置**：支持环境变量或工具参数覆盖默认 50K 限制
 
 ---
+
+## （3）feat：构建完整系统提示体系，支持 CLAUDE.md 发现、@include 指令、动态上下文注入
+
+**提交:** `待提交` | **修改 3 个文件，新增 2 个文件**
+
+> **一句话概括：** 从硬编码的简短 system prompt 升级为模板化、可插拔的完整提示体系，涵盖反模式接种、爆炸半径框架、工具偏好映射、CLAUDE.md 5 层发现、@include 指令、Deferred 工具名注入等关键设计。
+
+### 核心技术点
+
+#### 0. 提示词 7 层架构（从抽象到具体）
+
+系统提示词的内容从抽象到具体分为 7 层——先建立身份和约束框架，再填充具体行为指导。这个顺序很重要：模型先建立的概念会成为理解后续内容的框架。
+
+| 层级 | 名称 | 核心问题 | 对应章节 |
+|------|------|----------|----------|
+| 1 | Identity | 我是谁？ | `You are Muse Code, a lightweight coding assistant CLI.` |
+| 2 | System | 运行环境的基本事实 | `# System` — 权限模式、标签处理、上下文压缩 |
+| 3 | Doing Tasks | 怎么写代码？ | `# Doing tasks` — 反模式接种（3 条规则） |
+| 4 | Actions | 哪些操作需要确认？ | `# Executing actions with care` — 爆炸半径框架 |
+| 5 | Using Tools | 怎么用工具？ | `# Using your tools` — 偏好映射表 |
+| 6 | Tone & Style | 输出什么格式？ | `# Tone and style` — 简洁、无 emoji、文件引用格式 |
+| 7 | Output Efficiency | 怎么更简洁？ | `# Output efficiency` — 直奔主题、省略过渡语 |
+
+这种分层设计遵循认知心理学中的"锚定效应"：模型首先建立的身份和约束会锚定后续所有输出的基调，使得具体的行为指导更容易被一致地遵循。
+
+#### 1. 反模式接种（3 条规则）
+
+在系统提示中预埋了 3 条"反模式"规则，防止 LLM 陷入常见的不良行为：
+
+- **不过度工程**：不添加未被请求的功能、重构、文档、类型注解、错误处理、特性开关、兼容性垫片
+- **不创建不必要的抽象**：一次性操作不需要 helper，三行相似代码优于过早抽象
+- **不保留废弃代码**：不使用 `_var` 重命名、`// removed` 注释等向后兼容 hack，确认无用就彻底删除
+
+这些规则通过"先告诉模型不要做什么"来减少后续纠正轮次，比事后修补更高效。
+
+#### 2. @include 指令
+
+在 [prompt.py](file:///Users/lumine/code/llm/muse-code/muse_code/prompt.py#L140-L175) 中实现：
+
+- 支持 `@./path`、`@~/path`、`@/path` 三种引用语法，在 CLAUDE.md 中引用外部文件
+- 递归解析，最大深度 5 层（`_MAX_INCLUDE_DEPTH = 5`），防止无限递归
+- 循环引用检测：用 `visited` 集合记录已访问文件，遇到循环输出 `<!-- circular -->`
+- 文件不存在时输出 `<!-- not found -->`，读取失败输出 `<!-- error reading -->`
+- 所有路径都 resolve 为绝对路径后比较，防止符号链接绕过
+
+#### 3. CLAUDE.md 5 层发现 + .claude 子目录
+
+在 [prompt.py](file:///Users/lumine/code/llm/muse-code/muse_code/prompt.py#L193-L216) 中实现：
+
+- 从 `cwd` 向上遍历到根目录，收集所有层级的 `CLAUDE.md` 文件
+- 子目录的 CLAUDE.md 排在前面（`parts.insert(0, ...)`），确保最内层（项目级）优先级最高
+- 额外加载 `.claude/rules/*.md` 目录下的所有规则文件（按文件名排序）
+- 每个规则文件包裹 `<!-- rule: filename -->` 注释，方便溯源
+- 典型 5 层结构：`/CLAUDE.md` → `/home/CLAUDE.md` → `/home/user/CLAUDE.md` → `/home/user/project/CLAUDE.md` → `.claude/rules/*.md`
+
+#### 4. 爆炸半径框架
+
+在系统提示的 `# Executing actions with care` 章节中定义：
+
+- **核心原则**：考虑操作的可逆性和爆炸半径，本地可逆操作可自由执行，不可逆/影响共享状态的操作必须确认
+- **一次性授权不等于永久授权**：用户批准一次 `git push` 不代表所有场景都批准
+- **三类高风险操作**：
+  - 破坏性操作：删除文件/分支、rm -rf、覆盖未提交变更
+  - 难逆操作：force-push、reset --hard、修改 CI/CD
+  - 影响共享状态：推送代码、创建 PR、发送消息
+- **障碍处理原则**：不用破坏性操作绕过障碍，而是找根因修复（如解决冲突而非丢弃变更，调查锁文件而非删除）
+
+#### 5. 工具偏好映射表
+
+在系统提示的 `# Using your tools` 章节中定义了明确的工具优先级：
+
+| 场景 | 应使用 | 不应使用 |
+|------|--------|----------|
+| 读文件 | `read_file` | cat/head/tail/sed |
+| 编辑文件 | `edit_file` | sed/awk |
+| 创建文件 | `write_file` | cat heredoc/echo |
+| 列文件 | `list_files` | find/ls |
+| 搜索内容 | `grep_search` | grep/rg |
+| 系统命令 | `run_shell` | 仅在无专用工具时 |
+
+为什么专用工具优于 shell 命令？每个专用工具都在对应 shell 命令的基础上增加了关键能力：
+
+| 专用工具 | 对应 shell 命令 | 多出的能力 |
+|----------|----------------|-----------|
+| `read_file` | `cat` | 自动添加行号（`4 | content`），模型可直接用行号定位代码；记录读取 mtime，编辑前检查文件是否被外部修改 |
+| `edit_file` | `sed -i` | 精确字符串匹配替换（非行号依赖），自动生成 unified diff 供用户审查；唯一性检查（匹配多处时报错而非静默替换）；智能引号匹配（弯引号自动归一化） |
+| `write_file` | `cat > file` | 自动创建父目录（`mkdir -p`）；返回带行号的内容预览（前 30 行），用户可确认写入是否正确；自动更新 memory 索引 |
+| `list_files` | `find`/`ls` | 自动跳过 `node_modules` 和 `.git`；结果上限 200 条防止输出爆炸；glob 模式比 find 语法更直观 |
+| `grep_search` | `grep -r` | 跨平台兼容（Windows 回退 Python 实现）；结果上限 100 条防爆炸；支持 `include` 参数按文件类型过滤 |
+
+核心设计原则：**专用工具是结构化的、可审计的、有安全边界的**，而 shell 命令是原始的、不可控的。通过在提示中明确映射偏好，模型默认走安全路径，只在确实需要时才回退到 `run_shell`。
+
+#### 6. Deferred 工具名注入
+
+在 [prompt.py](file:///Users/lumine/code/llm/muse-code/muse_code/prompt.py#L233-L238) 中实现：
+
+- 从 `tools.py` 获取延迟工具名称列表（`get_deferred_tool_names()`）
+- 在系统提示末尾注入提示：`The following deferred tools are available via tool_search: enter_plan_mode, exit_plan_mode, agent. Use tool_search to fetch their full schemas when needed.`
+- 模型知道这些工具存在但不知道完整 schema，需要时才通过 `tool_search` 按需加载
+- 减少默认 tool schema 的 token 消耗，同时不隐藏工具的存在
+
+#### 7. 模板化变量插值
+
+在 [prompt.py](file:///Users/lumine/code/llm/muse-code/muse_code/prompt.py#L224-L243) 中实现：
+
+- 系统提示以模板形式内嵌（`SYSTEM_PROMPT_TEMPLATE`），使用 `{{variable}}` 占位符
+- 动态插值的变量：`cwd`、`date`、`platform`、`shell`、`git_context`、`claude_md`、`memory`、`skills`、`agents`、`deferred_tools`
+- Git 上下文自动获取：当前分支、最近 5 条 commit、工作区状态
+- Agent 构造函数支持 `custom_system_prompt` 参数，可覆盖默认生成的提示
+
+---

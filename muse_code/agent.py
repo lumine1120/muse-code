@@ -14,7 +14,7 @@ from .tools import (
     CONCURRENCY_SAFE_TOOLS,
     get_active_tool_definitions
 )
-from .prompt import SYSTEM_PROMPT
+from .prompt import build_system_prompt
 
 def _is_retryable(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
@@ -50,10 +50,11 @@ def _to_openai_tools(tools: list[dict]) -> list[dict]:
 
 
 class Agent:
-    def __init__(self, ui: UI):
+    def __init__(self, ui: UI, custom_system_prompt: str | None = None):
         self.ui = ui
         self.permission_mode = "default"
         self._aborted = False
+        self._base_system_prompt = custom_system_prompt or build_system_prompt()
         
         backend = os.getenv("MUSE_BACKEND", "openai").lower()
         self.use_openai = (backend != "anthropic")
@@ -67,14 +68,14 @@ class Agent:
             self.model = os.getenv("OPENAI_MODEL", "deepseek-v4-flash")
             self._openai_client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
             self._anthropic_client = None
-            self._openai_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            self._openai_messages = [{"role": "system", "content": self._base_system_prompt}]
         else:
             api_key = os.getenv("ANTHROPIC_API_KEY")
             self.model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
             self._anthropic_client = anthropic.AsyncAnthropic(api_key=api_key)
             self._openai_client = None
             self._anthropic_messages = []
-            self._system_prompt = SYSTEM_PROMPT
+            self._system_prompt = self._base_system_prompt
 
     def abort(self) -> None:
         self._aborted = True
