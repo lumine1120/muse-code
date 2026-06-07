@@ -1,0 +1,17 @@
+[project]
+name = "muse-code"
+version = "0.1.0"
+description = "A lightweight CLI agent framework"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "rich>=13.7.0",
+    "openai>=1.14.0",
+]
+
+[project.scripts]
+muse = "muse_code.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
