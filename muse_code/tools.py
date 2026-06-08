@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .memory import get_memory_dir
 from .frontmatter import parse_frontmatter
-from .context import persist_large_result
+from .context import persist_large_result, PERSIST_DIR as _PERSIST_DIR
 
 # ─── 权限模式常量（向后兼容）──────────────────
 
@@ -526,7 +526,13 @@ async def execute_tool(
                 read_file_state[abs_path] = os.path.getmtime(abs_path)
             except OSError:
                 pass
-        # Layer 0.5: persist large result → Layer 0: truncate
+        # Layer 0.5: 跳过已持久化的文件，防止无限重持久化循环
+        try:
+            file_path = Path(inp["file_path"]).resolve()
+            if _PERSIST_DIR.resolve() in file_path.parents or file_path.parent == _PERSIST_DIR.resolve():
+                return _truncate_result(result)
+        except Exception:
+            pass
         result = persist_large_result(name, result)
         return _truncate_result(result)
 

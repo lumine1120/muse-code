@@ -101,9 +101,6 @@ class Agent:
         backend = os.getenv("MUSE_BACKEND", "openai").lower()
         self.use_openai = (backend != "anthropic")
 
-        # 上下文管理器（必须在 model 确定后初始化）
-        self._context = ContextManager(self.model)
-
         # Read-before-edit state matching
         self._read_file_state: dict[str, float] = {}
 
@@ -127,6 +124,9 @@ class Agent:
             self._openai_client = None
             self._anthropic_messages = []
             self._system_prompt = self._base_system_prompt
+
+        # 上下文管理器（必须在 model 确定后初始化）
+        self._context = ContextManager(self.model)
 
         # 计划模式状态
         self._pre_plan_mode: str | None = None

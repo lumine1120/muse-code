@@ -745,6 +745,7 @@ Preview (first 200 lines):
 - **30KB 阈值低于 truncateResult 的 50K 限制**：在截断之前先拦截，避免不可逆的信息丢失
 - **可恢复 vs 不可恢复**：与 `_truncate_result` 的区别——持久化后数据仍在磁盘，模型可用 `read_file` 取回
 - **调用时机**：在 `truncateResult` 之前生效，持久化返回的预览文本通常远小于 50K，不会触发二次截断
+- **防循环**：`execute_tool` 在 `read_file` 读取 persisted 目录下的文件时跳过 persist_large_result，防止"读持久化文件 → 太大再次持久化 → 生成新文件 → 再读"的无限循环
 
 #### Layer 1：Budget 动态裁剪 (`budget_trim`)
 
@@ -867,5 +868,10 @@ utilization = estimate_current_input() / context_window
 - `/compact` 命令行为不变，底层实现升级为 LLM 摘要压缩
 - `show_cost()` 新增上下文利用率显示，原有字段不变
 - 所有现有 CLI 参数和 API 不变
+
+### Bug 修复
+
+- **ContextManager 初始化顺序**：原 `self._context = ContextManager(self.model)` 在 `self.model` 赋值前执行导致 `AttributeError`，已移至 if/else 块之后
+- **Persist 无限循环**：模型读取 `~/.muse/tool-results/` 目录下的已持久化文件时，若文件仍 >30KB 会再次触发持久化生成新文件，形成死循环。修复：`execute_tool` 检测到文件在 PERSIST_DIR 下时跳过 persist_large_result
 
 ---
