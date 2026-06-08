@@ -57,6 +57,8 @@ def main() -> None:
         print(
             "Muse Code — 轻量级编程助手 CLI\n\n"
             "用法: muse [选项] [提示词]\n\n"
+            "默认后端: 智谱AI (GLM-4.7-Flash 免费模型)，无需环境变量即可使用。\n"
+            "设置 OPENAI_API_KEY + OPENAI_BASE_URL 或 ANTHROPIC_API_KEY 可切换后端。\n\n"
             "选项:\n"
             "  --yolo, -y        跳过所有确认，自动执行\n"
             "  --plan             计划模式（只读）\n"
@@ -76,22 +78,19 @@ def main() -> None:
     model = args.model or os.environ.get("MUSE_MODEL")
 
     # 解析 API Key 和后端
+    # 默认使用 OpenAI 兼容后端（内置智谱AI免费凭据）
     resolved_api_key: str | None = None
-    resolved_use_openai = bool(args.api_base)
+    resolved_use_openai = True
 
-    if os.environ.get("OPENAI_API_KEY") and os.environ.get("OPENAI_BASE_URL"):
-        resolved_api_key = os.environ["OPENAI_API_KEY"]
-        resolved_use_openai = True
-    elif os.environ.get("ANTHROPIC_API_KEY"):
+    if os.environ.get("ANTHROPIC_API_KEY"):
         resolved_api_key = os.environ["ANTHROPIC_API_KEY"]
+        resolved_use_openai = False
     elif os.environ.get("OPENAI_API_KEY"):
         resolved_api_key = os.environ["OPENAI_API_KEY"]
-        resolved_use_openai = True
 
     if not resolved_api_key:
-        ui = UI()
-        ui.print_error("需要设置 API Key。请设置 OPENAI_API_KEY 或 ANTHROPIC_API_KEY 环境变量。")
-        sys.exit(1)
+        # 使用内置默认凭据（智谱AI免费模型 GLM-4.7-Flash），无需环境变量即可运行
+        pass
 
     # 如果通过 --api-base 指定，强制使用 OpenAI 后端
     if args.api_base:
@@ -179,6 +178,9 @@ async def run_repl(agent: Agent) -> None:
         # REPL 命令
         if inp == "/clear":
             agent.clear_history()
+            continue
+        if inp == "/whitelist":
+            agent.show_whitelist()
             continue
         if inp == "/cost":
             agent.show_cost()

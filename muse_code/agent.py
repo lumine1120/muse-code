@@ -12,9 +12,15 @@ import openai
 from .ui import UI
 from .tools import (
     execute_tool,
-    check_permission,
     CONCURRENCY_SAFE_TOOLS,
-    get_active_tool_definitions
+    get_active_tool_definitions,
+)
+from .permissions import (
+    PermissionChecker,
+    PermissionResult,
+    format_danger_warning,
+    detect_dangerous_commands,
+    SessionWhitelist,
 )
 from .prompt import build_system_prompt
 from .session import save_session, new_session_id
@@ -65,6 +71,7 @@ class Agent:
         api_base: str | None = None,
         anthropic_base_url: str | None = None,
         custom_system_prompt: str | None = None,
+        confirm_fn: Callable[[str], Awaitable[bool]] | None = None,
     ):
         self.ui = ui
         self.permission_mode = permission_mode
@@ -73,6 +80,7 @@ class Agent:
         self.max_turns = max_turns
         self._aborted = False
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
+        self.confirm_fn = confirm_fn  # 外部确认回调
 
         # 会话追踪
         self._session_id = new_session_id()
@@ -82,6 +90,12 @@ class Agent:
         self._total_input_tokens = 0
         self._total_output_tokens = 0
 
+        # ─── 权限与安全 ────────────────────────
+        # 会话白名单: 记录本次会话中用户已确认过的操作，避免重复询问
+        self._confirmed_paths: set[str] = set()
+        # 统一权限检查器
+        self._permission_checker = PermissionChecker(mode=permission_mode)
+
         # 自动判断后端
         backend = os.getenv("MUSE_BACKEND", "openai").lower()
         self.use_openai = (backend != "anthropic")
@@ -90,9 +104,10 @@ class Agent:
         self._read_file_state: dict[str, float] = {}
 
         if self.use_openai:
-            resolved_key = api_key or os.getenv("OPENAI_API_KEY", "sk-da55231cfba049438b776410797e5032")
-            resolved_base = api_base or os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com")
-            self.model = model or os.getenv("OPENAI_MODEL", "deepseek-v4-flash")
+            # 默认使用智谱AI免费模型，开箱即用，无需配置环境变量
+            resolved_key = api_key or os.getenv("OPENAI_API_KEY", "906aad8906cd4d21accfd202ecfec9a7.FItpB5LP18zYE8Th")
+            resolved_base = api_base or os.getenv("OPENAI_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/")
+            self.model = model or os.getenv("OPENAI_MODEL", "GLM-4.7-Flash")
             self._openai_client = openai.AsyncOpenAI(api_key=resolved_key, base_url=resolved_base)
             self._anthropic_client = None
             self._openai_messages = [{"role": "system", "content": self._base_system_prompt}]
@@ -117,7 +132,7 @@ class Agent:
         self._aborted = True
 
     def restore_session(self, session: dict[str, Any]) -> None:
-        """从保存的会话数据恢复消息历史"""
+        """从保存的会话数据恢复消息历史和白名单"""
         meta = session.get("metadata", {})
         self._session_id = meta.get("id", self._session_id)
         self._session_start = meta.get("startTime", self._session_start)
@@ -128,6 +143,15 @@ class Agent:
             self._openai_messages = session.get("openaiMessages", self._openai_messages)
         else:
             self._anthropic_messages = session.get("anthropicMessages", self._anthropic_messages)
+
+        # 恢复白名单
+        whitelist_data = session.get("whitelist")
+        if whitelist_data:
+            from .permissions import SessionWhitelist
+            self._permission_checker.whitelist = SessionWhitelist.from_dict(whitelist_data)
+        paths = session.get("confirmedPaths", [])
+        if paths:
+            self._confirmed_paths = set(paths)
 
     def clear_history(self) -> None:
         """清空对话历史，保留系统提示"""
@@ -149,6 +173,26 @@ class Agent:
             f"消息数: {msg_count}\n"
             f"预估费用: ${cost:.4f}{budget_info}{turn_info}"
         )
+
+    def show_whitelist(self) -> None:
+        """显示当前会话的白名单"""
+        summary = self._permission_checker.whitelist.get_summary()
+        confirmed = self._confirmed_paths
+        if not summary and not confirmed:
+            self.ui.print_system("会话白名单为空")
+            return
+
+        lines = ["会话白名单:"]
+        if confirmed:
+            lines.append(f"  已确认路径 ({len(confirmed)}):")
+            for path in sorted(confirmed):
+                lines.append(f"    • {path}")
+        if summary:
+            for tool, entries in summary.items():
+                lines.append(f"  {tool} ({len(entries)}):")
+                for entry in sorted(entries):
+                    lines.append(f"    • {entry}")
+        self.ui.print_system("\n".join(lines))
 
     def _get_current_cost_usd(self) -> float:
         """估算当前费用（基于 token 用量）"""
@@ -183,6 +227,8 @@ class Agent:
         if self.permission_mode == "plan":
             # 退出计划模式，恢复之前的权限模式
             self.permission_mode = self._pre_plan_mode or "default"
+            self._permission_checker.set_mode(self.permission_mode)
+            self._permission_checker.set_plan_file(None)
             self._pre_plan_mode = None
             self._plan_file_path = None
             self._system_prompt = self._base_system_prompt
@@ -194,7 +240,9 @@ class Agent:
             # 进入计划模式，保存当前权限模式
             self._pre_plan_mode = self.permission_mode
             self.permission_mode = "plan"
+            self._permission_checker.set_mode("plan")
             self._plan_file_path = self._generate_plan_file_path()
+            self._permission_checker.set_plan_file(self._plan_file_path)
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
             if self.use_openai and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
@@ -230,7 +278,7 @@ Write your plan incrementally to this file using write_file or edit_file. This i
 IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask the user to approve — exit_plan_mode handles that."""
 
     def _auto_save(self) -> None:
-        """自动保存会话到磁盘"""
+        """自动保存会话到磁盘（含白名单）"""
         data: dict[str, Any] = {
             "metadata": {
                 "id": self._session_id,
@@ -240,6 +288,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 "turnCount": self._turn_count,
                 "costUsd": self._cost_usd,
             },
+            # 持久化白名单
+            "whitelist": self._permission_checker.whitelist.to_dict(),
+            "confirmedPaths": list(self._confirmed_paths),
         }
         if self.use_openai:
             data["openaiMessages"] = self._openai_messages
@@ -281,8 +332,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             # 3. 定义回调：当流式响应收到一个完整的工具调用时，立即预执行安全工具
             def _on_tool_block(block: dict):
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
-                    perm = check_permission(block["name"], block["input"], self.permission_mode)
-                    if perm["action"] == "allow":
+                    perm = self._permission_checker.check(block["name"], block["input"])
+                    if perm.action == "allow":
                         task = asyncio.create_task(execute_tool(block["name"], block["input"], self._read_file_state))
                         early_executions[block["id"]] = task
 
@@ -318,12 +369,24 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
 
-                # 没有预执行的话，现在执行
-                perm = check_permission(tu.name, inp, self.permission_mode)
-                if perm["action"] == "deny":
-                    self.ui.print_error(f"Denied: {perm.get('message', '')}")
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": f"Action denied: {perm.get('message', '')}"})
+                # 没有预执行的话，现在进行权限检查
+                perm = self._permission_checker.check(tu.name, inp)
+                if perm.action == "deny":
+                    self.ui.print_error(f"Denied: {perm.message}")
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": f"Action denied: {perm.message}"})
                     continue
+
+                if perm.action == "confirm":
+                    # 检查会话白名单
+                    whitelist_id = perm.whitelist_identifier or perm.message
+                    if whitelist_id not in self._confirmed_paths:
+                        confirmed = await self._confirm_dangerous(tu.name, perm)
+                        if not confirmed:
+                            self._permission_checker.deny()
+                            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": f"User denied: {perm.message}"})
+                            continue
+                        self._confirmed_paths.add(whitelist_id)
+                        self._permission_checker.confirm(tu.name, whitelist_id)
 
                 res = await execute_tool(tu.name, inp, self._read_file_state)
                 self.ui.print_tool_result(res)
@@ -450,11 +513,23 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
                 self.ui.print_tool_call(fn_name, json.dumps(inp))
 
-                perm = check_permission(fn_name, inp, self.permission_mode)
-                if perm["action"] == "deny":
-                    self.ui.print_error(f"Denied: {perm.get('message', '')}")
-                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.get('message', '')}"})
+                perm = self._permission_checker.check(fn_name, inp)
+                if perm.action == "deny":
+                    self.ui.print_error(f"Denied: {perm.message}")
+                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.message}"})
                     continue
+
+                if perm.action == "confirm":
+                    # 检查会话白名单
+                    whitelist_id = perm.whitelist_identifier or perm.message
+                    if whitelist_id not in self._confirmed_paths:
+                        confirmed = await self._confirm_dangerous(fn_name, perm)
+                        if not confirmed:
+                            self._permission_checker.deny()
+                            oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"User denied: {perm.message}"})
+                            continue
+                        self._confirmed_paths.add(whitelist_id)
+                        self._permission_checker.confirm(fn_name, whitelist_id)
                 
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
@@ -493,6 +568,44 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         self.ui.print_tool_result(res)
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
 
+
+    # ─── 危险命令确认 ──────────────────────────────────────
+
+    async def _confirm_dangerous(self, tool_name: str, perm: PermissionResult) -> bool:
+        """向用户确认危险操作，返回 True 表示用户同意。
+        
+        显示危险等级、描述信息，然后等待用户确认。
+        支持外部 confirm_fn 回调或内置交互式确认。
+        """
+        danger_level = perm.danger_level
+        descriptions = perm.danger_descriptions or []
+
+        # 显示警告信息
+        if danger_level and descriptions:
+            self.ui.console.print(format_danger_warning(
+                detect_dangerous_commands(perm.message)
+            ))
+        self.ui.print_confirmation(perm.message, danger_level)
+
+        # 优先使用外部回调（如测试或 GUIsd
+        if self.confirm_fn:
+            return await self.confirm_fn(perm.message)
+
+        # 内置交互式确认
+        try:
+            prompt = "  Allow? (y/n/always): "
+            answer = input(prompt).strip().lower()
+            if answer == "always":
+                # 加入会话白名单
+                if perm.whitelist_identifier:
+                    self._confirmed_paths.add(perm.whitelist_identifier)
+                    self.ui.print_whitelist_added(perm.whitelist_identifier)
+                return True
+            if answer.startswith("y"):
+                return True
+            return False
+        except (EOFError, KeyboardInterrupt):
+            return False
 
     async def _call_openai_stream(self) -> dict:
         async def _do():

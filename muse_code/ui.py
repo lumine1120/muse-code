@@ -71,7 +71,7 @@ class UI:
         self.console.print(Panel.fit(
             "[bold blue]Welcome to Muse Code[/bold blue]\n"
             "输入消息开始对话，输入 exit 退出\n"
-            "命令: /clear /cost /compact /plan",
+            "命令: /clear /cost /compact /plan /whitelist",
             border_style="blue"
         ))
 
@@ -106,3 +106,19 @@ class UI:
 
     def print_error(self, error: str):
         self.console.print(f"[bold red]! {error}[/bold red]")
+
+    def print_confirmation(self, message: str, danger_level: str | None = None):
+        """打印危险操作确认提示"""
+        level_color = {
+            "critical": "bold red",
+            "high": "bold red",
+            "medium": "yellow",
+            "low": "dim",
+        }
+        color = level_color.get(danger_level or "", "yellow")
+        self.console.print(f"  [{color}]⚠ 需要确认:[/{color}] {message}")
+
+    def print_whitelist_added(self, identifier: str):
+        """打印白名单添加提示"""
+        preview = identifier[:60] + "..." if len(identifier) > 60 else identifier
+        self.console.print(f"  [dim green]✓ 已加入会话白名单: {preview}[/dim green]")

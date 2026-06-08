@@ -330,5 +330,339 @@
 - 工具调用摘要（`_get_tool_summary`）：根据工具类型生成简短描述（如 `read_file` 只显示文件名）
 - 工具结果截断显示（500 字符上限）
 
+---
+## （5）feat：权限与安全模块全面升级 — 危险命令检测、规则系统、统一权限检查、会话白名单
+
+> **一句话概括：** 从零散的权限判断升级为结构化安全体系，新增 4 级危险命令检测、用户+项目级 allow/deny 规则、统一权限检查流水线、会话级白名单记忆——让 AI 执行操作时既有"护栏"又有"记忆力"。
+
+### 背景：为什么需要权限与安全？
+
+当你让一个 AI 编程助手帮你写代码时，它可能会做这些事情：
+
+- 读取你的项目文件（通常是安全的）
+- **修改**你的源码（需要确认）
+- **删除**文件或目录（危险！）
+- 执行 `rm -rf /` 这种灾难性命令（绝对不能执行）
+- 运行 `git push --force` 覆盖远程分支（需要二次确认）
+
+权限系统的核心问题是：**哪些操作可以自动执行？哪些需要问你？哪些应该直接禁止？** 以及——**同一个操作你同意过一次后，能不能别再问了？**
+
+本次升级把权限逻辑从散落在 `tools.py` 和 `agent.py` 中的零碎代码，重构为独立的 `permissions.py` 模块（670+ 行），包含四大子系统：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  PermissionChecker                  │
+│                  （统一权限检查器）                     │
+│                                                      │
+│  ┌──────────────┐  ┌──────────────┐                 │
+│  │ 危险命令检测   │  │ 权限规则系统  │                 │
+│  │ 4级风险 + 37  │  │ 用户+项目级   │                 │
+│  │ 种危险模式    │  │ allow + deny │                 │
+│  └──────┬───────┘  └──────┬───────┘                 │
+│         │                  │                         │
+│         ▼                  ▼                         │
+│  ┌──────────────────────────────────────┐           │
+│  │         检查流水线（9 步）              │           │
+│  │  bypassPermissions → 规则 → 只读工具   │           │
+│  │  → plan模式 → 模式切换 → acceptEdits  │           │
+│  │  → 危险检测 → 会话白名单 → dontAsk    │           │
+│  └──────────────────────────────────────┘           │
+│                         │                            │
+│                         ▼                            │
+│  ┌──────────────────────────────────────┐           │
+│  │         SessionWhitelist             │           │
+│  │         （会话级白名单）                │           │
+│  │  "你同意过的，我都记得"                 │           │
+│  └──────────────────────────────────────┘           │
+└─────────────────────────────────────────────────────┘
+```
+
+### 子模块 1：危险命令检测（4 级风险体系）
+
+原来的危险命令检测只是一个"是否危险"的是非判断，现在升级为 4 级风险体系：
+
+| 风险等级 | 含义 | 示例命令 | 默认行为 |
+|----------|------|----------|----------|
+| `critical` 🔴 | 极度危险，可能破坏系统 | `rm -rf /`、`mkfs`、`dd if=`、写块设备 | 必须确认 + 强烈警告 |
+| `high` 🟠 | 高风险但可恢复 | `rm`、`sudo`、`chmod 777`、`git push --force` | 必须确认 + 警告 |
+| `medium` 🟡 | 中等风险，可能造成不便 | `kill`、`git rebase`、`curl \| sh` | 需要确认 |
+| `low` 🟢 | 潜在风险，通常不触发 | `grep -r /`、`npm publish` | 不主动触发确认 |
+
+**使用场景举例**：
+
+```python
+# 场景 1：用户让 AI "清理临时文件"
+# AI 生成了命令：rm -rf /tmp/build/*
+# 系统检测到：
+>>> from muse_code.permissions import detect_dangerous_commands
+>>> detects = detect_dangerous_commands("rm -rf /tmp/build/*")
+>>> for d in detects:
+...     print(f"[{d.level.value}] {d.description}")
+[critical] 递归强制删除文件/目录
+[high] 删除文件
+
+# 场景 2：AI 想执行一个正常的 npm 命令
+>>> from muse_code.permissions import is_dangerous
+>>> is_dangerous("npm run build")
+False  # 安全，不需要确认
+
+# 场景 3：AI 想用 sudo 安装系统包
+>>> is_dangerous("sudo apt-get install redis")
+True   # 需要确认（因为用了 sudo 提权）
+```
+
+新增了 **37 种危险模式**（原 16 种），覆盖 Linux/macOS/Windows 三大平台，包括：
+- 系统破坏类（`rm -rf`、`mkfs`、`dd`、写 `/dev/*`）
+- Git 危险操作（`push --force`、`reset --hard`、`rebase`）
+- 权限变更（`sudo`、`chmod 777`、`chown`）
+- 远程代码执行（`curl | sh`、`wget | sh`）
+- Docker 清理（`docker rm`、`docker system prune`）
+- Windows 命令（`format`、`taskkill /f`、`Remove-Item -Recurse`）
+
+### 子模块 2：权限规则系统（用户级 + 项目级，Allow + Deny）
+
+你可以通过配置文件定义哪些操作"永远允许"或"永远禁止"，而不用每次都在终端手动确认。
+
+**配置文件位置**：
+- 用户级：`~/.muse/settings.json`（对所有项目生效）
+- 项目级：`.muse/settings.json`（只对当前项目生效）
+
+**配置示例**：
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "read_file",                          // 允许读取任何文件
+      "write_file(/home/user/project/*)",   // 允许写 project 下的文件
+      "run_shell(npm test)",                // 允许运行 npm test
+      "run_shell(git status)",              // 允许运行 git status
+      "run_shell(python -m pytest *)",      // 允许运行 pytest
+      "grep_search"                         // 允许搜索任何内容
+    ],
+    "deny": [
+      "run_shell(rm *)",                    // 禁止任何 rm 命令
+      "run_shell(sudo *)",                  // 禁止任何 sudo 命令
+      "write_file(/etc/*)",                 // 禁止写 /etc 目录
+      "edit_file(/etc/*)",                  // 禁止编辑 /etc 目录
+      "run_shell(curl * | sh)"             // 禁止远程脚本执行
+    ]
+  }
+}
+```
+
+**规则格式说明**：
+
+| 规则写法 | 含义 | 例子 |
+|----------|------|------|
+| `tool_name` | 匹配该工具的所有调用 | `read_file` → 允许读任何文件 |
+| `tool_name(pattern)` | 匹配参数中 pattern 的内容 | `run_shell(npm test)` → 只允许 `npm test` |
+| `tool_name(/path/*)` | 通配符匹配文件路径 | `write_file(/project/src/*)` → 允许写 src 下文件 |
+| `tool_name(/path...)` | 前缀匹配 | `write_file(/home/user...)` → 允许写 home 目录 |
+
+**优先级规则**：Deny 永远优先于 Allow（安全第一）。如果用户级和项目级冲突，用户级 deny > 项目级 deny > 用户级 allow > 项目级 allow。
+
+**实际场景**：
+
+> 你在公司项目里工作，不想让 AI 意外修改 `/etc` 下的配置文件，也不希望它用 `sudo`。同时你经常需要 AI 帮你跑 `npm test` 和 `pytest`，不想每次都确认。
+
+在项目的 `.muse/settings.json` 写入：
+```json
+{
+  "permissions": {
+    "deny": [
+      "write_file(/etc/*)",
+      "run_shell(sudo *)"
+    ],
+    "allow": [
+      "run_shell(npm test)",
+      "run_shell(python -m pytest *)"
+    ]
+  }
+}
+```
+
+这样 AI 运行 `npm test` 时直接通过，想 `sudo rm file` 时直接被拦截。
+
+### 子模块 3：统一权限检查器（9 步流水线）
+
+`PermissionChecker` 把所有判断逻辑整合为一条清晰的流水线，每一步都有明确的责任：
+
+```
+用户操作请求
+    │
+    ▼
+[1] bypassPermissions？  ──是──▶ 直接放行
+    │否
+    ▼
+[2] 权限规则检查 (deny优先)  ──命中 deny──▶ 拦截拒绝
+    │命中 allow
+    ▼
+    直接放行
+    │未命中
+    ▼
+[3] 是只读工具？(read_file等)  ──是──▶ 直接放行
+    │否
+    ▼
+[4] plan 模式？  ──是──▶ 只允许操作计划文件
+    │否
+    ▼
+[5] 模式切换工具？(enter/exit_plan)  ──是──▶ 直接放行
+    │否
+    ▼
+[6] acceptEdits + 编辑工具？  ──是──▶ 自动允许
+    │否
+    ▼
+[7] 需要确认吗？(写文件/运行shell/危险命令)
+    │是
+    ▼
+[8] 在会话白名单中？  ──是──▶ 直接放行
+    │否
+    ▼
+[9] dontAsk 模式？  ──是──▶ 自动拒绝
+    │否
+    ▼
+    弹出确认 → 用户同意 → 加入白名单 → 执行
+```
+
+**使用示例**：
+
+```python
+from muse_code.permissions import PermissionChecker
+
+checker = PermissionChecker(mode="default")
+
+# 读取文件 — 自动放行
+result = checker.check("read_file", {"file_path": "/home/user/main.py"})
+print(result.action)  # "allow"
+
+# 运行危险命令 — 需要确认
+result = checker.check("run_shell", {"command": "rm -rf /tmp/build"})
+print(result.action)         # "confirm"
+print(result.danger_level)   # "critical"
+print(result.danger_descriptions)  # ["递归强制删除文件/目录", "删除文件"]
+
+# 用户确认后
+checker.confirm("run_shell", "rm -rf /tmp/build")
+# 下次同样命令在白名单中，不会再问
+result = checker.check("run_shell", {"command": "rm -rf /tmp/build"})
+print(result.action)  # "allow" — 白名单记忆生效！
+```
+
+### 子模块 4：会话级白名单（"你同意过的，我都记得"）
+
+这是最影响用户体验的功能。在没有白名单之前，AI 每次写文件你都要手动确认——比如改 5 个文件就要确认 5 次。有了白名单后：
+
+- **同一个操作只问一次**：你同意 AI 编辑 `main.py` 后，它再改这个文件就不再问了
+- **目录级白名单**：你同意 AI 写 `/project/src/` 目录后，所有 `src/` 下的文件自动放行
+- **持久化**：白名单跟随会话，下次启动（如果用 `--resume`）仍然有效
+- **三种来源**：
+  - `session`：当前会话中手动确认的（会过期）
+  - `user`：用户级 settings.json 预设的
+  - `project`：项目级 settings.json 预设的
+
+**交互示例**（模拟终端对话）：
+
+```
+You: 帮我把所有 Python 文件里的 print 改成 logger.info
+
+Muse Code: 好的，我先搜索一下。
+  🔍 grep_search   print
+
+Muse Code: 找到了 5 个文件需要修改：main.py, utils.py, config.py, 
+  api.py, models.py。开始逐个修改。
+
+  ✏️ edit_file   main.py: 'print(...)...'
+  ⚠ 需要确认: 修改文件: /project/src/main.py
+  Allow? (y/n/always): always     ← 用户输入 always
+
+  ✓ 已加入会话白名单: /project/src/main.py
+  [diff 显示修改内容]
+
+  ✏️ edit_file   utils.py: 'print(...)...'
+  ✓ 白名单匹配，自动放行          ← 不再问！
+  [diff 显示修改内容]
+
+  ✏️ edit_file   config.py: 'print(...)...'
+  ✓ 白名单匹配，自动放行          ← 同一目录自动放行
+  [diff 显示修改内容]
+
+  ...（继续自动处理剩余文件）
+```
+
+**实现细节**：
+
+```python
+from muse_code.permissions import SessionWhitelist
+
+wl = SessionWhitelist()
+
+# 添加一个目录到白名单
+wl.add("write_file", "/home/user/project/src/")
+
+# 检查子文件 — 父目录匹配自动生效
+wl.contains("write_file", "/home/user/project/src/main.py")        # True
+wl.contains("write_file", "/home/user/project/src/sub/deep/file.py") # True
+wl.contains("write_file", "/other/project/file.py")                # False
+
+# 添加一个命令到白名单
+wl.add("run_shell", "npm test")
+
+# 只能匹配到完全相同的命令
+wl.contains("run_shell", "npm test")        # True
+wl.contains("run_shell", "npm run build")   # False
+
+# 查看当前白名单状态
+wl.get_summary()
+# {'write_file': ['/home/user/project/src/'], 'run_shell': ['npm test']}
+
+# 序列化 — 可以保存到会话文件
+data = wl.to_dict()
+# 恢复
+wl2 = SessionWhitelist.from_dict(data)
+```
+
+### 五种权限模式速查表
+
+这张表概括了所有模式下各类工具的行为，帮你快速选择合适的模式：
+
+| 模式（CLI 参数） | 读工具<br>`read_file` 等 | 编辑工具<br>`write/edit_file` | Shell（安全命令）<br>`npm test`、`ls` 等 | Shell（危险命令）<br>`rm -rf`、`sudo` 等 | 适用场景 |
+|------------------|:--:|:--:|:--:|:--:|----------|
+| **default**<br>`muse` | ✅ 自动放行 | ⚠️ 弹出确认 | ⚠️ 弹出确认 | 🔴 弹出确认<br>（含危险等级提示） | 日常使用<br>平衡安全与效率 |
+| **plan**<br>`muse --plan` | ✅ 自动放行 | ❌ 拒绝<br>（仅计划文件例外） | ❌ 拒绝 | ❌ 拒绝 | 只规划不执行<br>审查方案后用 |
+| **acceptEdits**<br>`muse --accept-edits` | ✅ 自动放行 | ✅ 自动放行 | ⚠️ 弹出确认 | 🔴 弹出确认 | 信任 AI 的文件编辑<br>只想审查命令 |
+| **bypassPermissions**<br>`muse --yolo` | ✅ 自动放行 | ✅ 自动放行 | ✅ 自动放行 | ✅ 自动放行 | YOLO 模式<br>完全信任，无确认 |
+| **dontAsk**<br>`muse --dont-ask` | ✅ 自动放行 | ❌ 自动拒绝 | ✅ 自动放行 | ❌ 自动拒绝 | CI/CD 非交互环境<br>自动拒绝所有需确认操作 |
+
+> **记忆规则**：
+> - `default` 是万能模式——安全的事自动做，危险的事问你
+> - `--yolo`（bypassPermissions）是"我全都要"——什么都不问，直接干
+> - `--dont-ask` 是"我问不了你"——能自动做的就做，需要确认的直接拒绝
+> - `--plan` 是"让我想想"——只能看不能改，方案满意了再执行
+> - `--accept-edits` 是"代码你改，命令问我"——信任编辑能力，保留命令审查
+
+### 文件变更
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `muse_code/permissions.py` | **新增** | 核心权限与安全模块（670+ 行），包含全部 4 个子系统 |
+| `muse_code/tools.py` | 修改 | 移除约 120 行重复权限代码，通过 re-export 委托给 permissions.py |
+| `muse_code/agent.py` | 修改 | 新增 `PermissionChecker`、`_confirmed_paths` 白名单、`_confirm_dangerous()` 交互确认方法 |
+| `muse_code/ui.py` | 修改 | 新增 `print_confirmation()`（带颜色等级）和 `print_whitelist_added()` |
+
+### 向后兼容
+
+所有旧 API 保持不变，现有代码无需修改：
+
+```python
+# 旧代码仍然正常工作
+from muse_code.tools import check_permission, is_dangerous, load_permission_rules
+
+result = check_permission("run_shell", {"command": "rm -rf /tmp"}, mode="default")
+# {'action': 'confirm', 'message': 'rm -rf /tmp', 'danger_level': 'critical', ...}
+```
+
+唯一的差异：返回的 `dict` 现在多了 `danger_level` 和 `danger_description` 字段（如果命令有危险的话），方便 UI 层做更丰富的展示。
+
 
 ---
