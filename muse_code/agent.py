@@ -24,6 +24,7 @@ from .permissions import (
 )
 from .prompt import build_system_prompt
 from .session import save_session, new_session_id
+from .context import ContextManager
 
 def _is_retryable(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
@@ -100,6 +101,9 @@ class Agent:
         backend = os.getenv("MUSE_BACKEND", "openai").lower()
         self.use_openai = (backend != "anthropic")
 
+        # 上下文管理器（必须在 model 确定后初始化）
+        self._context = ContextManager(self.model)
+
         # Read-before-edit state matching
         self._read_file_state: dict[str, float] = {}
 
@@ -168,10 +172,12 @@ class Agent:
         budget_info = f" / ${self.max_cost_usd} 预算" if self.max_cost_usd else ""
         turn_info = f" | 轮次: {self._turn_count}/{self.max_turns}" if self.max_turns else ""
         msg_count = len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
+        util = self._context.counter.effective_utilization(self.model)
+        util_pct = f" | 上下文利用率: {util * 100:.1f}%" if util > 0 else ""
         self.ui.print_system(
             f"Token: {self._total_input_tokens} in / {self._total_output_tokens} out\n"
             f"消息数: {msg_count}\n"
-            f"预估费用: ${cost:.4f}{budget_info}{turn_info}"
+            f"预估费用: ${cost:.4f}{budget_info}{turn_info}{util_pct}"
         )
 
     def show_whitelist(self) -> None:
@@ -198,6 +204,12 @@ class Agent:
         """估算当前费用（基于 token 用量）"""
         return (self._total_input_tokens / 1_000_000) * 3 + (self._total_output_tokens / 1_000_000) * 15
 
+    def _record_tokens(self, input_tokens: int, output_tokens: int) -> None:
+        """记录 token 使用量（同步更新 Agent 字段和 ContextManager）"""
+        self._total_input_tokens += input_tokens
+        self._total_output_tokens += output_tokens
+        self._context.counter.record_usage(input_tokens, output_tokens)
+
     def _check_budget(self) -> dict:
         """检查是否超出预算或轮次限制"""
         if self.max_cost_usd is not None and self._get_current_cost_usd() >= self.max_cost_usd:
@@ -207,20 +219,27 @@ class Agent:
         return {"exceeded": False}
 
     async def compact(self) -> None:
-        """压缩对话历史：保留系统提示 + 最近 4 条消息"""
+        """压缩对话历史：使用 LLM 生成摘要替换历史（Layer 3 Auto-compact）"""
         if self.use_openai:
-            if len(self._openai_messages) > 5:
-                system = self._openai_messages[0]
-                self._openai_messages = [system] + self._openai_messages[-4:]
-                self.ui.print_system("对话已压缩")
-            else:
+            if len(self._openai_messages) < 5:
                 self.ui.print_system("对话较短，无需压缩")
+                return
+            prev_len = len(self._openai_messages)
+            self._openai_messages = await self._context.do_compact_openai(
+                self._openai_messages, self._openai_client
+            )
+            after_len = len(self._openai_messages)
         else:
-            if len(self._anthropic_messages) > 4:
-                self._anthropic_messages = self._anthropic_messages[-4:]
-                self.ui.print_system("对话已压缩")
-            else:
+            if len(self._anthropic_messages) < 4:
                 self.ui.print_system("对话较短，无需压缩")
+                return
+            prev_len = len(self._anthropic_messages)
+            self._anthropic_messages = await self._context.do_compact_anthropic(
+                self._anthropic_messages, self._anthropic_client, self._system_prompt
+            )
+            after_len = len(self._anthropic_messages)
+        
+        self.ui.print_system(f"对话已压缩 ({prev_len} → {after_len} 条消息)")
 
     def toggle_plan_mode(self) -> str:
         """切换计划模式（只读），返回当前权限模式"""
@@ -319,12 +338,22 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     # ─── Anthropic backend ───────────────────────────────────────
 
     async def _chat_anthropic(self, user_message: str) -> None:
+        # Layer 3: Check auto-compact at turn boundary (before adding user message)
+        if self._context.should_auto_compact():
+            self.ui.print_system("上下文窗口即将填满，正在压缩对话...")
+            self._anthropic_messages = await self._context.do_compact_anthropic(
+                self._anthropic_messages, self._anthropic_client, self._system_prompt
+            )
+
         # 1. 把用户消息加入上下文
         self._anthropic_messages.append({"role": "user", "content": user_message})
 
         while True:
             if self._aborted:
                 break
+
+            # Layer 1+2: Budget + Snip pipeline before each API call
+            self._context.run_pre_call_pipeline(self._anthropic_messages, use_openai=False)
 
             # 2. 准备预执行字典
             early_executions: dict[str, asyncio.Task] = {}
@@ -339,6 +368,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             # 4. 调用流式 API！
             response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+
+            # 记录 token 使用量
+            if hasattr(response, "usage"):
+                self._record_tokens(
+                    getattr(response.usage, "input_tokens", 0),
+                    getattr(response.usage, "output_tokens", 0),
+                )
 
             # 5. 从完整响应里提取所有工具调用
             tool_uses = [b for b in response.content if b.type == "tool_use"]
@@ -476,6 +512,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     # ─── OpenAI-compatible backend ───────────────────────────────
 
     async def _chat_openai(self, user_message: str) -> None:
+        # Layer 3: Check auto-compact at turn boundary (before adding user message)
+        if self._context.should_auto_compact():
+            self.ui.print_system("上下文窗口即将填满，正在压缩对话...")
+            self._openai_messages = await self._context.do_compact_openai(
+                self._openai_messages, self._openai_client
+            )
+
         # 1. 用户消息加入上下文
         self._openai_messages.append({"role": "user", "content": user_message})
 
@@ -483,8 +526,19 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._aborted:
                 break
 
+            # Layer 1+2: Budget + Snip pipeline before each API call
+            self._context.run_pre_call_pipeline(self._openai_messages, use_openai=True)
+
             # 2. 调用流式 API
             response = await self._call_openai_stream()
+
+            # 记录 token 使用量
+            usage = response.get("usage")
+            if usage:
+                self._record_tokens(
+                    usage.get("input_tokens", 0),
+                    usage.get("output_tokens", 0),
+                )
 
             # 3. 解析响应
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
@@ -618,7 +672,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 model=self.model,
                 tools=_to_openai_tools(filtered_tools),
                 messages=self._openai_messages,
-                stream=True  # 关键！开启流式
+                stream=True,  # 关键！开启流式
+                stream_options={"include_usage": True},  # 让最后 chunk 包含 usage
             )
 
             # 初始化变量
@@ -626,9 +681,16 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             first_text = True
             tool_calls: dict[int, dict] = {}  # 按索引存储工具调用
             finish_reason = ""
+            stream_usage = None  # 从流式最后一个 chunk 获取 usage
             # 循环处理每个流式 chunk
             async for chunk in stream:
                 if not chunk.choices:
+                    # 最后一个 chunk 可能只有 usage 没有 choices
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        stream_usage = {
+                            "input_tokens": getattr(chunk.usage, "prompt_tokens", None) or getattr(chunk.usage, "input_tokens", 0),
+                            "output_tokens": getattr(chunk.usage, "completion_tokens", None) or getattr(chunk.usage, "output_tokens", 0),
+                        }
                     continue
                 delta = chunk.choices[0].delta
 
@@ -677,7 +739,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         "tool_calls": assembled,
                     },
                     "finish_reason": finish_reason or "stop",
-                }]
+                }],
+                "usage": stream_usage,
             }
 
         return await _with_retry(_do)

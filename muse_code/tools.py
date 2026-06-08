@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .memory import get_memory_dir
 from .frontmatter import parse_frontmatter
+from .context import persist_large_result
 
 # ─── 权限模式常量（向后兼容）──────────────────
 
@@ -525,6 +526,8 @@ async def execute_tool(
                 read_file_state[abs_path] = os.path.getmtime(abs_path)
             except OSError:
                 pass
+        # Layer 0.5: persist large result → Layer 0: truncate
+        result = persist_large_result(name, result)
         return _truncate_result(result)
 
     if name in ("write_file", "edit_file") and read_file_state is not None:
@@ -565,7 +568,10 @@ async def execute_tool(
     handler = handlers.get(name)
     if not handler:
         return f"Unknown tool: {name}"
-    result = _truncate_result(handler(inp))
+    # Layer 0.5: persist large result → Layer 0: truncate
+    raw = handler(inp)
+    result = persist_large_result(name, raw)
+    result = _truncate_result(result)
 
     # 在成功写入/编辑后更新 mtime
     if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):

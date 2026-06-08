@@ -666,3 +666,206 @@ result = check_permission("run_shell", {"command": "rm -rf /tmp"}, mode="default
 
 
 ---
+
+## （6）feat：上下文管理模块 — 4 层分级压缩管道
+
+> **一句话概括：** 防止对话历史超出 LLM 上下文窗口（GLM-4.7-Flash 128K），实现 4 层渐进式压缩：大结果持久化（>30KB→磁盘）、Budget 动态裁剪（50%/70%双阈值）、Snip 去重替换、Auto-compact 全量摘要压缩。
+
+### 背景：为什么需要上下文管理？
+
+免费模型 GLM-4.7-Flash 上下文窗口仅 128K tokens。在多轮对话中，尤其是涉及读取大文件、执行长命令输出、多次搜索的场景下，消息历史会迅速膨胀。一旦超出窗口，API 会直接报错或静默截断，导致模型丢失关键上下文。
+
+上下文管理的核心策略是 **渐进式压缩**：先用成本最低的手段（截断/去重），只在必要时才动更重的武器（LLM 摘要）。4 层管道配合触发时机，在保留关键信息的同时控制上下文大小。
+
+### 架构设计
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    ContextManager                            │
+│                                                             │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐   │
+│  │ TokenCounter   │  │ Persist        │  │ Compactor     │   │
+│  │ (usage锚点统计)│  │ (磁盘持久化)   │  │ (LLM摘要生成) │   │
+│  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘   │
+│          │                  │                   │           │
+│          ▼                  ▼                   ▼           │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │              4 层压缩管道                              │   │
+│  │                                                       │   │
+│  │  🔵 Layer 0:   truncate_result (>50K chars→截断)       │   │
+│  │  🔵 Layer 0.5: persist_large_result (>30KB→磁盘)      │   │
+│  │  🟡 Layer 1:   budget_trim (50%/70%双阈值)             │   │
+│  │  🟠 Layer 2:   snip (同文件去重，保留最近3个)           │   │
+│  │  🟣 Layer 2.5: microcompact (5min空闲→激进清理)        │   │
+│  │  🔴 Layer 3:   auto_compact (85%窗口→LLM摘要)          │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│  触发时机:                                                   │
+│    工具执行后 → Layer 0 + Layer 0.5 (执行即触发)              │
+│    API调用前  → Layer 1 + Layer 2 + Layer 2.5 (零API成本)    │
+│    轮次边界   → Layer 3 (利用率>85%)                         │
+│    手动       → /compact 强制 Layer 3                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5 层详解
+
+> 每层清理的目标、触发时机、信息是否可恢复：
+
+| 层级 | 清理目标 | 操作粒度 | 具体操作 | 触发时机 | 丢失信息是否可恢复 | 是否存磁盘 | API 成本 |
+|------|----------|----------|----------|----------|:--:|:--:|:--:|
+| **0** truncate | 工具结果内容 | 截断保留头尾 | >50K chars→截断，提示用 grep/read_file | 每次工具执行后 | ❌ 截断部分永丢 | ❌ | 0 |
+| **0.5** persist | 工具结果内容 | 截断 + 存盘 | >30KB → 磁盘存完整版，消息里留 200 行预览 | 每次工具执行后（在 L0 之前） | ✅ `read_file` 取回 | ✅ `~/.muse/tool-results/` | 0 |
+| **1** budget | 工具结果内容 | 截断保留头尾 | 利用率 >50%→<30K, >70%→<15K | 每次 API 调用前 | ❌ 截断部分永丢 | ❌ | 0 |
+| **2** snip | 工具结果内容 | 替换为占位符 | 同文件重复读取→旧结果替换为 `[Content snipped]` | 利用率 >60%，每次 API 调用前 | ⚠️ 可重新调工具获取 | ❌ | 0 |
+| **2.5** microcompact | 工具结果内容 | 替换为占位符 | 空闲 >5min→旧结果替换为 `[Old result cleared]` | 每次 API 调用前 | ⚠️ 可重新调工具获取 | ❌ | 0 |
+| **3** auto-compact | 整段对话历史 | 删除消息 | LLM 摘要替换掉 [1]~[N] 之间全部消息 | 利用率 >85%，轮次边界 / `/compact` | ❌ 原始对话永丢 | ❌ | 1 次 API 调用 |
+
+**消息结构 vs 内容**：L0~2.5 只改 `tool` 消息的 `content` 字段，消息本身还在——模型仍知道"我调过 read_file"。L3 直接删消息重建数组，是最重的操作。
+
+**L0 与 L0.5 的阈值配合**：`persist` 用 **30KB(字节)** 做门槛，`truncate` 用 **50K(字符)**。30KB 字节 = 最多 ~30K chars，在任何编码下都小于 50K 字符，所以 persist 永远先拦截。目的是"低门槛先存盘（可恢复）、高门槛后截断（兜底）"——正常源码 200 行预览远小于 50K，truncate 只有遇到 minified 长行文件才触发。
+
+#### Layer 0.5：大结果持久化 (`persist_large_result`)
+
+超过 **30KB** 的工具结果自动写入 `~/.muse/tool-results/{timestamp}-{tool}-{hash}.txt`，上下文仅保留 200 行预览 + 文件路径提示。
+
+```
+# 示例：read_file 返回一个 80KB 的大文件
+[Result too large (82.3 KB, 2500 lines). 
+ Full output saved to ~/.muse/tool-results/1712345678-read_file-a1b2c3d4.txt. 
+ You can use read_file to see the full result.]
+
+Preview (first 200 lines):
+   1 | import ...
+   2 | ...
+ 200 | def helper():
+```
+
+**设计要点**：
+- **30KB 阈值低于 truncateResult 的 50K 限制**：在截断之前先拦截，避免不可逆的信息丢失
+- **可恢复 vs 不可恢复**：与 `_truncate_result` 的区别——持久化后数据仍在磁盘，模型可用 `read_file` 取回
+- **调用时机**：在 `truncateResult` 之前生效，持久化返回的预览文本通常远小于 50K，不会触发二次截断
+
+#### Layer 1：Budget 动态裁剪 (`budget_trim`)
+
+每次 API 调用前，根据当前上下文利用率动态收紧已存在的工具结果大小：
+
+| 利用率 | 预算 | 效果 |
+|--------|------|------|
+| < 50% | 不触发 | 工具结果保持原样 |
+| 50% - 70% | 30K 字符 | 较温和的截断 |
+| > 70% | 15K 字符 | 激进截断，为后续对话腾空间 |
+
+双阈值设计保证在上下文宽裕时多保留细节，紧张时自动收紧。
+
+```python
+# context.py — apply_budget_openai
+utilization = counter.effective_utilization(model)
+if utilization < 0.50:
+    return  # 不触发
+budget = 15000 if utilization > 0.70 else 30000
+# 对 history 中的所有 tool_result content 应用 budget_trim_text
+```
+
+#### Layer 2：Snip 去重替换 (`apply_snip`)
+
+利用率 > 60% 时触发，替换过时/重复的工具结果：
+
+- **同文件多次读取**：同一文件被 `read_file` 多次读取，只保留最近 3 次，旧的替换为 `[Content snipped - re-read if needed]`
+- **同类搜索结果**：`grep_search` / `list_files` 去重，保留最近 3 个
+- **最近 3 个永远保留**：不论去重逻辑，最近 3 个 tool_result 不会被 snip
+
+关键设计：**只清 content，保留元数据**。模型仍能看到"我之前读了 main.py"，只是看不到内容了，可以重新调用 `read_file`。
+
+#### Layer 2.5：Microcompact 缓存冷启动清理 (`apply_microcompact`)
+
+空闲超过 **5 分钟** 时触发，除最近 3 个工具结果外全部替换为 `[Old result cleared]`：
+
+```
+# 示例：连续 6 次 read_file 后空闲 6 分钟
+[Old result cleared]           ← 第 1 次读取，5min 超时被清
+[Old result cleared]           ← 第 2 次读取，被清
+[Old result cleared]           ← 第 3 次读取，被清
+file_b.py content...           ← 最近第 3 个，保留
+file_c.py content...           ← 最近第 2 个，保留  
+file_d.py content...           ← 最近第 1 个，保留
+```
+
+**设计原理**：prompt cache 有 TTL（Claude 约 5 分钟），空闲超时后缓存大概率已过期。此时继续保存旧消息内容没有缓存命中优势，不如激进清理——下次 API 调用会重建 cache prefix，清理这些内容没有额外成本。
+
+与 Snip 的区别：Snip 是选择性的（同文件去重）、利用率触发；Microcompact 是无差别的（时间触发）、更激进——比 Snip 多清一层。
+
+#### Layer 3：Auto-compact 全量摘要压缩
+
+当有效窗口利用率 ≥ **85%** 时，在轮次边界（用户输入 push 进消息数组后、API 调用前）触发：
+
+1. 调用同一个 LLM，用专用 system prompt（`"You are a conversation summarizer..."`）生成对话摘要
+2. 剥离旧的对话历史，替换为：`[摘要] → [Assistant确认] → [最新用户消息]`
+3. 重置 `lastInputTokenCount`，让后续 Budget/Snip 基于新的较小上下文工作
+
+**安全措施**：
+- **熔断器**：连续 3 次压缩失败后不再尝试（防止无限 API 调用浪费）
+- **后备截断**：如果 LLM 摘要生成失败，回退到简单截断（保留最近 4 条消息）
+- **只在轮次边界调用**：不在 tool 循环中段调用，避免切断 `tool_use`/`tool_result` 配对导致 API 报错
+
+### Token 统计
+
+`TokenCounter` 类实现两层估算：
+
+1. **API 锚点**：每次 API 调用后用返回的 `usage.input_tokens` 更新锚点，这是准确的
+2. **增量估算**：锚点之后新增的消息用 `4 chars ≈ 1 token` 粗估
+
+```
+estimate_current_input() = last_input_tokens + (新增字符数 // 4)
+utilization = estimate_current_input() / context_window
+```
+
+误差控制在 < 5%，无需额外 API 调用来统计 token。
+
+### 文件变更
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `muse_code/context.py` | **新增** | 上下文管理核心模块（~400 行），包含 TokenCounter、4 层压缩函数、ContextManager 入口 |
+| `muse_code/tools.py` | 修改 | 在 `execute_tool` 中注入 `persist_large_result`，在 `_truncate_result` 之前生效 |
+| `muse_code/agent.py` | 修改 | 初始化 ContextManager、API 调用前执行 Layer 1+2 管道、API 调用后记录 token、轮次边界检查 Layer 3 auto-compact、更新 `compact()` 方法、`show_cost()` 显示利用率 |
+| `muse_code/__main__.py` | 无需修改 | `/compact` 命令已调用 `agent.compact()`，自动使用新实现 |
+
+### 使用示例
+
+```python
+# 自动触发场景模拟：
+# 
+# 1. 用户让 AI 分析一个 100KB 的日志文件
+#    → Layer 0.5: 日志内容写入磁盘，上下文只保留 200 行预览
+#
+# 2. 多轮对话后利用率达 55%
+#    → Layer 1: 旧工具结果被截断到 30K
+#    → Layer 2: 重复的文件读取被 snip 替换
+#
+# 3. 利用率继续升高到 87%
+#    → Layer 3: 触发 auto-compact，LLM 生成对话摘要替换历史
+#
+# 4. 手动触发压缩
+#    > /compact
+#    对话已压缩 (18 → 4 条消息)
+```
+
+### 与 Claude Code / mini_claude 对比
+
+| 维度 | Claude Code | mini_claude | Muse Code |
+|------|------------|-------------|-----------|
+| 压缩层级 | 5 级流水线 | 4 层 | 6 层 (L0+L0.5+L1+L2+L2.5+L3) |
+| Microcompact | 时间+缓存编辑双路径 | 仅 5min 空闲触发 | 5min 空闲触发，和 Snip 共用保留阈值 |
+| 持久化 | 磁盘持久化，2KB 预览 | 磁盘持久化（>30KB），200 行预览 | 磁盘持久化（>30KB），200 行预览 |
+| Token 计数 | 锚点+粗估 | 直接用 API usage | 锚点+增量粗估 |
+| Auto-compact | 两阶段摘要+恢复+熔断器 | 单段摘要，无恢复 | 单段摘要+后备截断+3 次熔断器 |
+| 上下文窗口 | 按模型确定 | 按模型确定 | 按模型名匹配，向前缀兼容 |
+
+### 向后兼容
+
+- `/compact` 命令行为不变，底层实现升级为 LLM 摘要压缩
+- `show_cost()` 新增上下文利用率显示，原有字段不变
+- 所有现有 CLI 参数和 API 不变
+
+---
