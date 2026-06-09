@@ -227,28 +227,19 @@ def _write_file(inp: dict) -> str:
 
 
 def _auto_update_memory_index(file_path: str) -> None:
+    """write_file 钩子：写入路径属于 memory_dir 时，重建 MEMORY.md 索引。
+    
+    实际重建逻辑委托给 memory 模块，保持单一数据源。
+    """
     try:
         mem_dir = str(get_memory_dir())
-        if file_path.startswith(mem_dir) and file_path.endswith(".md") and not file_path.endswith("MEMORY.md"):
-            mem_path = Path(mem_dir)
-            lines = ["# Memory Index", ""]
-            for f in sorted(mem_path.glob("*.md")):
-                if f.name == "MEMORY.md":
-                    continue
-                try:
-                    raw = f.read_text()
-                    name_match = re.search(r"^name:\s*(.+)$", raw, re.MULTILINE)
-                    type_match = re.search(r"^type:\s*(.+)$", raw, re.MULTILINE)
-                    desc_match = re.search(r"^description:\s*(.+)$", raw, re.MULTILINE)
-                    if name_match and type_match:
-                        n = name_match.group(1).strip()
-                        t = type_match.group(1).strip()
-                        d = desc_match.group(1).strip() if desc_match else ""
-                        lines.append(f"- **[{n}]({f.name})** ({t}) — {d}")
-                except Exception:
-                    pass
-            (mem_path / "MEMORY.md").write_text("\n".join(lines))
+        if (file_path.startswith(mem_dir)
+                and file_path.endswith(".md")
+                and not file_path.endswith("MEMORY.md")):
+            from .memory import update_memory_index
+            update_memory_index()
     except Exception:
+        # 索引更新失败不应影响主写入流程
         pass
 
 

@@ -25,6 +25,11 @@ from .permissions import (
 from .prompt import build_system_prompt
 from .session import save_session, new_session_id
 from .context import ContextManager
+from .memory import (
+    start_memory_prefetch,
+    format_memories_for_injection,
+    MemoryPrefetch,
+)
 
 def _is_retryable(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
@@ -128,6 +133,12 @@ class Agent:
         # 上下文管理器（必须在 model 确定后初始化）
         self._context = ContextManager(self.model)
 
+        # 记忆召回状态：
+        # _already_surfaced_memories — 本会话已经展示过的记忆路径，避免同一条反复打扰
+        # _session_memory_bytes      — 累计召回字节数，超过 60KB 后停止再召回
+        self._already_surfaced_memories: set[str] = set()
+        self._session_memory_bytes: int = 0
+
         # 计划模式状态
         self._pre_plan_mode: str | None = None
         self._plan_file_path: str | None = None
@@ -209,6 +220,104 @@ class Agent:
         self._total_input_tokens += input_tokens
         self._total_output_tokens += output_tokens
         self._context.counter.record_usage(input_tokens, output_tokens)
+
+    # ─── 记忆召回 ───────────────────────────────────────
+
+    def _build_side_query(self):
+        """构造一个轻量级模型调用闭包，专门用于记忆语义筛选。
+        
+        sideQuery 是不带工具、不进入主对话历史的"侧通道"——
+        它只负责一件事：让模型从一份记忆清单中挑出相关的几条。
+        这样做的好处是不污染主对话上下文，也不会卷入工具调用循环。
+        """
+        if self._anthropic_client is not None:
+            client = self._anthropic_client
+            model = self.model
+
+            async def _sq_anthropic(system: str, user_message: str) -> str:
+                resp = await client.messages.create(
+                    model=model, max_tokens=256, system=system,
+                    messages=[{"role": "user", "content": user_message}],
+                )
+                return "".join(b.text for b in resp.content if b.type == "text")
+
+            return _sq_anthropic
+
+        if self._openai_client is not None:
+            client = self._openai_client
+            model = self.model
+
+            async def _sq_openai(system: str, user_message: str) -> str:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    max_tokens=256,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_message},
+                    ],
+                )
+                if not resp.choices:
+                    return ""
+                return resp.choices[0].message.content or ""
+
+            return _sq_openai
+
+        return None
+
+    def _consume_memory_prefetch_openai(self, prefetch: MemoryPrefetch | None) -> None:
+        """非阻塞消费 OpenAI 后端的记忆预取结果。
+        
+        每轮主循环开始时调用：如果预取已 settled 就把记忆追加到最后一条 user 消息，
+        否则直接放过——后续轮次会再次检查。这样既不阻塞首次 API 调用，
+        又能在结果就绪后及时注入。
+        """
+        if prefetch is None or prefetch.consumed or not prefetch.settled:
+            return
+        prefetch.consumed = True
+        try:
+            memories = prefetch.task.result()
+        except Exception:
+            return
+        if not memories:
+            return
+
+        injection_text = format_memories_for_injection(memories)
+        last = self._openai_messages[-1] if self._openai_messages else None
+        if last and last.get("role") == "user":
+            last["content"] = (last.get("content") or "") + "\n\n" + injection_text
+        else:
+            self._openai_messages.append({"role": "user", "content": injection_text})
+
+        for m in memories:
+            self._already_surfaced_memories.add(m.path)
+            self._session_memory_bytes += len(m.content.encode())
+
+    def _consume_memory_prefetch_anthropic(self, prefetch: MemoryPrefetch | None) -> None:
+        """Anthropic 后端版本：把记忆注入到最后一条 user 消息（content 可能是 list）。"""
+        if prefetch is None or prefetch.consumed or not prefetch.settled:
+            return
+        prefetch.consumed = True
+        try:
+            memories = prefetch.task.result()
+        except Exception:
+            return
+        if not memories:
+            return
+
+        injection_text = format_memories_for_injection(memories)
+        last = self._anthropic_messages[-1] if self._anthropic_messages else None
+        if last and last.get("role") == "user":
+            content = last.get("content", "")
+            if isinstance(content, str):
+                last["content"] = content + "\n\n" + injection_text
+            elif isinstance(content, list):
+                content.append({"type": "text", "text": injection_text})
+        else:
+            self._anthropic_messages.append({"role": "user", "content": injection_text})
+
+        for m in memories:
+            self._already_surfaced_memories.add(m.path)
+            self._session_memory_bytes += len(m.content.encode())
 
     def _check_budget(self) -> dict:
         """检查是否超出预算或轮次限制"""
@@ -348,9 +457,21 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         # 1. 把用户消息加入上下文
         self._anthropic_messages.append({"role": "user", "content": user_message})
 
+        # 启动异步记忆预取（每轮一次）。返回 None 时表示不满足触发条件，无需后续轮询。
+        memory_prefetch: MemoryPrefetch | None = None
+        sq = self._build_side_query()
+        if sq:
+            memory_prefetch = start_memory_prefetch(
+                user_message, sq,
+                self._already_surfaced_memories, self._session_memory_bytes,
+            )
+
         while True:
             if self._aborted:
                 break
+
+            # 非阻塞消费记忆预取：完成则注入，未完成则下一轮再检查
+            self._consume_memory_prefetch_anthropic(memory_prefetch)
 
             # Layer 1+2: Budget + Snip pipeline before each API call
             self._context.run_pre_call_pipeline(self._anthropic_messages, use_openai=False)
@@ -522,9 +643,21 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         # 1. 用户消息加入上下文
         self._openai_messages.append({"role": "user", "content": user_message})
 
+        # 启动异步记忆预取（每轮一次）。返回 None 时表示不满足触发条件，无需后续轮询。
+        memory_prefetch: MemoryPrefetch | None = None
+        sq = self._build_side_query()
+        if sq:
+            memory_prefetch = start_memory_prefetch(
+                user_message, sq,
+                self._already_surfaced_memories, self._session_memory_bytes,
+            )
+
         while True:
             if self._aborted:
                 break
+
+            # 非阻塞消费记忆预取：完成则注入，未完成则下一轮再检查
+            self._consume_memory_prefetch_openai(memory_prefetch)
 
             # Layer 1+2: Budget + Snip pipeline before each API call
             self._context.run_pre_call_pipeline(self._openai_messages, use_openai=True)

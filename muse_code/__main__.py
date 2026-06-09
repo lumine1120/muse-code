@@ -191,6 +191,20 @@ async def run_repl(agent: Agent) -> None:
         if inp == "/plan":
             agent.toggle_plan_mode()
             continue
+        if inp == "/memory":
+            from .memory import list_memories, get_memory_dir
+            memories = list_memories()
+            if not memories:
+                ui.print_system(
+                    f"尚未保存任何记忆。记忆目录：{get_memory_dir()}"
+                )
+            else:
+                lines = [f"共 {len(memories)} 条记忆，目录：{get_memory_dir()}"]
+                for m in memories:
+                    desc = m.description or "(no description)"
+                    lines.append(f"  [{m.type}] {m.name} — {desc}")
+                ui.print_system("\n".join(lines))
+            continue
 
         try:
             await agent.run(inp)

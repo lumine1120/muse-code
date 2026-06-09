@@ -834,22 +834,143 @@ utilization = estimate_current_input() / context_window
 
 ### 使用示例
 
-```python
-# 自动触发场景模拟：
-# 
-# 1. 用户让 AI 分析一个 100KB 的日志文件
-#    → Layer 0.5: 日志内容写入磁盘，上下文只保留 200 行预览
-#
-# 2. 多轮对话后利用率达 55%
-#    → Layer 1: 旧工具结果被截断到 30K
-#    → Layer 2: 重复的文件读取被 snip 替换
-#
-# 3. 利用率继续升高到 87%
-#    → Layer 3: 触发 auto-compact，LLM 生成对话摘要替换历史
-#
-# 4. 手动触发压缩
-#    > /compact
-#    对话已压缩 (18 → 4 条消息)
+下面是一个完整的会话演示，展示每层压缩在什么时候触发、对消息数组做了什么。
+
+```
+# ── 第 1 轮：读取一个大日志文件 ──
+
+> 帮我分析 /var/log/app.log 的错误
+Muse Code
+  📖 read_file /var/log/app.log
+
+  [Result too large (82.3 KB, 2500 lines). Full output saved to 
+  ~/.muse/tool-results/1712345678-read_file-a1b2c3d4.txt. 
+  You can use read_file to see the full result.]
+
+  Preview (first 200 lines):
+    1 | 2024-01-01 INFO  Server started
+    2 | 2024-01-01 DEBUG Loading config...
+  ...（省略中间内容）...
+  200 | 2024-01-01 WARN  Connection pool low
+
+Muse Code: 从预览中看到开头有正常启动日志，让我用 grep_search 
+  精确定位错误行。
+  🔍 grep_search ERROR
+  Found 15 matches:
+    app.log:234  ERROR  Database timeout
+    app.log:567  ERROR  API rate limit exceeded
+    ...
+
+Muse Code: 有两个主要错误类型：数据库超时和 API 限流。需要修复...
+```
+
+**在此期间消息数组的变化：**
+
+```
+# read_file 返回前，Layer 0.5 persist 拦截：
+  raw_result = "1 | ... 2500 lines ..."   # 82KB 原始内容
+  → persist_large_result 存盘
+  → 返回 200 行预览 （~8KB）
+  → Layer 0 truncate 检查：8KB < 50K → 不触发
+  → 最终放入上下文：8KB 预览文本
+
+# /cost 查看当前状态：
+  Token: 12500 in / 800 out
+  消息数: 6
+  上下文利用率: 11.6%
+```
+
+```
+# ── 第 5 轮：多次读写后利用率上升 ──
+
+> 把 utils.py 的超时时间改成 10 秒
+Muse Code: 好的，让我先确认当前超时值。
+  📖 read_file utils.py
+  ... （工具结果放回上下文）...
+
+Muse Code
+  ✏️ edit_file utils.py
+  @@ -42,3 +42,3 @@
+  -TIMEOUT = 5
+  +TIMEOUT = 10
+
+> /cost
+  Token: 62000 in / 3500 out
+  消息数: 38
+  上下文利用率: 57.4%
+
+# ← 利用率 > 50%，Layer 1 budget 开始生效：
+# 旧 tool 消息被截断到 30K 字符，头尾保留。
+# 利用率 > 60%，Layer 2 snip 也开始工作：
+# 同一个文件读了 5 次，旧 4 次被替换为 [Content snipped]
+```
+
+```
+# ── 第 8 轮：上下文接近窗口上限 ──
+
+> 帮我看看这个最新的 error log
+Muse Code: 上下文窗口即将填满，正在压缩对话...
+  # ← Layer 3 auto-compact 触发（利用率 87%）
+  # 内部流程：
+  #   1. sideQuery → LLM 生成摘要：
+  #      "User is debugging a production app with database timeout 
+  #       and API rate limit issues. Fixed TIMEOUT in utils.py from 
+  #       5s to 10s. Explored connection pool config in pool.py..."
+  #   2. 旧消息数组（38 条）→ 新数组：
+  #      [system, summary_user, summary_assistant, latest_user]
+  #   3. last_input_tokens 重置为 0
+
+对话已压缩 (38 → 4 条消息)
+
+Muse Code: 好的，让我查看最新的错误日志...
+  📖 read_file error.log
+  ...
+
+> /cost
+  Token: 8500 in / 600 out
+  消息数: 6
+  上下文利用率: 7.9%
+```
+
+**消息数组压缩前后对比：**
+
+```
+# 压缩前 (38 条):
+[system, user "分析日志", assistant "...", tool "1|...", 
+ assistant "...", user "修复超时", assistant "...", tool "1|...",
+ ... 30 多条 ...
+ user "看看最新 error log"]
+
+# 压缩后 (4 条):
+[system,
+ user "[Previous conversation summary]
+      User is debugging... Fixed TIMEOUT in utils.py from 5→10s...",
+ assistant "Understood. I have the context... How can I continue helping?",
+ user "看看最新 error log"]
+```
+
+```
+# ── 手动压缩 ──
+
+> /compact
+  对话已压缩 (24 → 4 条消息)
+
+# 无论利用率是否达到 85%，/compact 直接强制触发 Layer 3
+```
+
+```
+# ── Microcompact 场景（空闲 5 分钟后） ──
+
+# 用户去开会了，回来继续：
+> 继续刚才的分析，把 pool config 也改了
+Muse Code: （Pipeline 检测到 last_api_call_time 超过 5 分钟）
+  # ← Layer 2.5 microcompact 触发：
+  # 旧 tool 结果 → [Old result cleared]
+  # 最近 3 个保留
+  
+Muse Code
+  📖 read_file pool.py
+  ...
 ```
 
 ### 与 Claude Code / mini_claude 对比
@@ -873,5 +994,444 @@ utilization = estimate_current_input() / context_window
 
 - **ContextManager 初始化顺序**：原 `self._context = ContextManager(self.model)` 在 `self.model` 赋值前执行导致 `AttributeError`，已移至 if/else 块之后
 - **Persist 无限循环**：模型读取 `~/.muse/tool-results/` 目录下的已持久化文件时，若文件仍 >30KB 会再次触发持久化生成新文件，形成死循环。修复：`execute_tool` 检测到文件在 PERSIST_DIR 下时跳过 persist_large_result
+
+---
+
+## （7）feat：记忆系统 — 4 类型记忆 + sideQuery 语义召回 + 异步预取
+
+> **一句话概括：** 给 Agent 加一个"会越用越懂你"的持久记忆库——把用户偏好、纠正反馈、项目状态、外部资源等不可推导信息存成本地 markdown 文件，用 sideQuery 做语义召回 + 异步预取，零阻塞地把相关记忆注入对话上下文。
+
+### 背景：为什么需要记忆系统？
+
+会话级 Agent 有个根本痛点——**每次重启都"失忆"**。你已经告诉它三次"不要在末尾总结"，下次启动它还是会总结。如果只是单纯把所有历史塞进 system prompt，token 又会被无关信息撑爆。
+
+记忆系统的本质是：**用文件做长期存储，用语义召回做选择性注入**。下面这些信息适合记下来：
+
+- 用户偏好（"我用 Python，不要写注释"）
+- 行为反馈（"上次纠正过你不要乱重构"）
+- 项目状态（"Q3 的目标是迁移认证模块"）
+- 外部资源（"CI 仪表盘在 ci.example.com"）
+
+而代码、git 历史、可推导的项目结构这些**不要存**——读代码或 `git log` 就能拿到，记下来只会过时漂移。
+
+### 架构设计
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                     Memory System                           │
+│                                                             │
+│  ~/.muse/projects/{sha256(cwd)[:16]}/memory/                │
+│  ├── MEMORY.md                       ← 索引（注入 system）   │
+│  ├── user_prefers_concise.md         ← 偏好                │
+│  ├── feedback_no_summary.md          ← 反馈                │
+│  ├── project_auth_q3.md              ← 项目                │
+│  └── reference_ci_dashboard.md       ← 资源                │
+│                                                             │
+│  双轨加载策略：                                              │
+│                                                             │
+│  ┌─────────────────────────────────────┐                    │
+│  │ 轨道 1：System Prompt（每会话固定）  │                    │
+│  │ MEMORY.md 索引 → 让模型知道有什么    │                    │
+│  └─────────────────────────────────────┘                    │
+│                                                             │
+│  ┌─────────────────────────────────────┐                    │
+│  │ 轨道 2：sideQuery 语义召回（按需）   │                    │
+│  │ 用户输入 → 异步预取（与首次API并行）  │                    │
+│  │   ↓                                  │                    │
+│  │ 让小模型从清单选 ≤5 条相关记忆        │                    │
+│  │   ↓                                  │                    │
+│  │ 包装 <system-reminder> 注入用户消息  │                    │
+│  └─────────────────────────────────────┘                    │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 核心设计点
+
+#### 1. 4 种封闭分类（不允许自由标签）
+
+| 类型 | 记什么 | 何时记 |
+|------|--------|--------|
+| **user** | 用户身份、偏好、知识背景 | 了解到用户角色或偏好时 |
+| **feedback** | 用户的纠正和肯定（必须含 Why + How to apply） | 用户纠正/肯定某个行为时 |
+| **project** | 进展、目标、决策、截止日期 | 了解到项目动态时 |
+| **reference** | 外部系统的定位（URL、工具、仪表盘） | 了解到外部资源时 |
+
+为什么不允许自由标签？标签膨胀（"important"、"misc"、"tmp"...）会让召回时模糊匹配——4 种封闭类型保证召回精度。
+
+#### 2. 项目隔离（同目录共享，跨目录隔离）
+
+记忆目录：`~/.muse/projects/{sha256(cwd)[:16]}/memory/`
+
+哈希 cwd 的结果做命名空间：
+- 同一个项目目录无论何时启动 Agent 都进同一个记忆库
+- 切换项目目录自动隔离，不会污染
+- 截前 16 字节够用（碰撞概率近乎零），又不至于路径太长
+
+#### 3. 文件 + 索引双层结构
+
+每条记忆是独立 markdown 文件（YAML frontmatter + 正文）：
+
+```markdown
+---
+name: 不要在末尾总结
+description: 用户明确要求省略总结段落
+type: feedback
+---
+**Why:** 用户觉得总结浪费时间，更喜欢直接看 diff。
+**How to apply:** 完成任务后直接结束，不要加"以上是..."段落。
+```
+
+`MEMORY.md` 是"目录"，每条记忆一行链接：
+
+```markdown
+# Memory Index
+
+- **[不要在末尾总结](feedback_no_summary.md)** (feedback) — 用户明确要求省略总结段落
+- **[Q3 认证迁移](project_auth_q3.md)** (project) — 8 月底前完成 OAuth 迁移
+```
+
+写入触发：`write_file` 检测路径属于 memory_dir 自动重建索引——**模型只管写新记忆，索引零维护成本**。
+
+#### 4. 双截断防御（曾踩过的坑）
+
+`load_memory_index()` 同时做行截断和字节截断：
+- **MAX_INDEX_LINES = 200**：正常防护，按完整条目截断
+- **MAX_INDEX_BYTES = 25KB**：异常防御，曾踩坑 197KB 内容塞在 200 行内的真实案例
+
+单维度限制不够，两个维度都设上限最稳。
+
+#### 5. sideQuery 语义召回（核心创新）
+
+传统关键词搜索匹配不到"用户问'我之前说过怎么部署吗' → 项目部署清单记忆"这种语义关联。所以引入 **sideQuery**：
+
+```
+用户查询  →  把所有记忆的"目录"喂给小模型  →  让模型选 ≤5 条相关记忆
+                                                ↓
+                                       按需读完整内容注入对话
+```
+
+**sideQuery 是个"侧通道"模型调用**：传 system + user_message，返回纯文本。不带工具、不进入主对话历史，专门做记忆筛选这种辅助任务，不污染主上下文。
+
+#### 6. 异步预取（关键性能优化）
+
+如果用户每次输入都要等 sideQuery 选完记忆才能发主请求，每轮多一次 API 往返延迟。所以做**异步预取**：
+
+```
+用户按下回车的瞬间：
+  ┌──────────────────────────────────────────┐
+  │ 主线：用户消息 → 主模型 API（首轮调用）   │
+  │ 侧线：sideQuery 异步召回（与主线并行）    │
+  └──────────────────────────────────────────┘
+                          ↓
+                  下一轮主循环开始时
+                          ↓
+                  非阻塞轮询：settled 了吗？
+                  是 → 注入到最后一条 user message
+                  否 → 跳过，下一轮再查
+```
+
+延迟成本：**0 毫秒**（与主调用并行）。
+
+#### 7. 三个触发门控（防止无意义调用）
+
+```python
+def start_memory_prefetch(query, ...):
+    if not re.search(r"\s", query.strip()):  # 单词查询不触发
+        return None
+    if session_memory_bytes >= 60 * 1024:    # 会话累计已超 60KB
+        return None
+    if no .md files in memory_dir:           # 还没存过任何记忆
+        return None
+```
+
+单词查询跳过的原因：sideQuery 缺乏上下文做不出准确选择——"bug" 这种词配合所有记忆都"看起来相关"，全选了反而拖累主上下文。
+
+#### 8. 时效警告（防止陈旧记忆当事实）
+
+```python
+def memory_freshness_warning(mtime_ms):
+    days = (now - mtime_ms) / 86400_000
+    if days > 1:
+        return f"This memory is {days} days old. Memories are point-in-time observations, "
+               "not live state — descriptions of code behavior may be stale."
+```
+
+记忆是**时间点观察**，不是实时状态。"上周这个文件这样写"过几天可能就改了。每条召回的旧记忆都附带过期警告，让模型在引用前主动验证。
+
+#### 9. 已展示去重（防打扰）
+
+```python
+self._already_surfaced_memories: set[str]  # 本会话已经注入过的记忆路径
+```
+
+同一条记忆在一个会话内只展示一次。避免用户问相关问题时反复看到同一条提示。
+
+### 注入格式：`<system-reminder>`
+
+召回的记忆包装成这个标签注入到下一条 user 消息里：
+
+```
+<system-reminder>
+This memory is 5 days old. Memories are point-in-time observations...
+
+Memory: /Users/.../feedback_no_summary.md:
+
+---
+name: 不要在末尾总结
+type: feedback
+---
+**Why:** 用户觉得浪费时间。
+**How:** 完成任务直接结束。
+</system-reminder>
+```
+
+为什么用 user 消息嵌入而不是 system role：
+- **时序对**：召回是用户输入触发的，逻辑上属于"用户上下文增强"
+- **兼容性**：OpenAI/Anthropic 都允许 user 消息嵌套提示
+- **显眼度**：模型对 `<system-reminder>` 标签敏感度较高
+
+### 文件变更
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `muse_code/frontmatter.py` | **重写** | 实现 YAML frontmatter 解析/序列化（之前是占位空 dict） |
+| `muse_code/memory.py` | **重写** | 完整记忆系统（~400 行）：增删改查、索引重建、头部扫描、sideQuery 召回、异步预取 |
+| `muse_code/agent.py` | 修改 | 集成预取启动 + 非阻塞消费 + 已展示去重 + sideQuery 构造器（双后端） |
+| `muse_code/tools.py` | 修改 | `_auto_update_memory_index` 委托给 memory 模块，单一数据源 |
+| `muse_code/__main__.py` | 修改 | 新增 REPL 命令 `/memory` 列出当前所有记忆 |
+
+### 使用示例
+
+下面演示一次完整的"存 → 召回 → 自动生效"流程，展示消息数组在每个步骤的实际状态。
+
+```
+# ═══════ 第 1 次会话 ═══════
+
+> 你好，我习惯用 Python 3.12+ 写代码，回复时不要带类型注解，
+  也不要写 docstring，直接给代码就行
+```
+
+**（1）System Prompt 固定注入**
+
+每次会话 system prompt 都会包含一段记忆系统说明。如果还没存过任何记忆，尾部是空的：
+
+```
+# System Prompt 相关片段（部分）:
+...
+# 记忆系统
+你拥有一个持久的、基于文件的记忆系统。...
+（尚未保存任何记忆。）
+```
+
+**（2）模型识别偏好并保存**
+
+模型在对话中检测到明确偏好后，主动调用 `write_file` 保存：
+
+```
+📖 write_file ~/.muse/projects/a1b2.../memory/feedback_no_type_annotations.md
+---
+name: 不使用类型注解和docstring
+description: 用户偏好Pythonic代码，不需要类型注解和docstring
+type: feedback
+---
+用户要求代码中不要添加类型注解和docstring，直接给出干净代码。
+
+**Why:** 用户认为Python的类型系统和docstring影响可读性，
+更喜欢简洁直接的代码风格。
+**How to apply:** 写Python代码时省略所有类型注解和docstring，
+只在用户明确要求时才添加。
+---
+```
+
+**（3）MEMORY.md 索引自动重建**
+
+写入完成后 `_auto_update_memory_index` 钩子自动触发，重建索引：
+
+```markdown
+# Memory Index
+
+- **[不使用类型注解和docstring](feedback_no_type_annotations.md)** (feedback) — 用户偏好Pythonic代码，不需要类型注解和docstring
+```
+
+```
+> /memory
+共 1 条记忆，目录：~/.muse/projects/a1b2.../memory
+  [feedback] 不使用类型注解和docstring — 用户偏好Pythonic代码
+```
+
+**（4）@include CLAUDE.md 集成**
+
+用户也可以手动引用记忆（新版已支持 @include 指令）——但大多数场景模型会自动处理。以下是侧边对话：
+
+```
+> 记住：CI 地址是 https://ci.mycompany.com/dashboard/app
+
+📖 write_file ~/.muse/.../memory/reference_ci_dashboard.md
+---
+name: CI仪表盘地址
+description: 项目CI系统的URL
+type: reference
+---
+https://ci.mycompany.com/dashboard/app
+```
+
+**（5）系统提示更新**
+
+写入后下一次 API 调用时系统提示会自动包含新索引：
+
+```
+# System Prompt 相关片段:
+...
+## 当前记忆索引
+
+- **[不使用类型注解和docstring](feedback_no_type_annotations.md)** (feedback) — 用户偏好...
+- **[CI仪表盘地址](reference_ci_dashboard.md)** (reference) — 项目CI系统的URL
+```
+
+```
+# ═══════ 重启程序，第 2 次会话 ═══════
+
+> 帮我写个排序函数
+```
+
+**（6）异步预取启动（与主调用并行，零延迟）**
+
+用户按回车的瞬间，两条路径并行启动：
+
+```
+┌─ 路径 1（主线）────────────────────┐
+│ POST /chat/completions            │
+│ messages: [                       │
+│   {role:"system", content:"..."}, │
+│   {role:"user", content:          │
+│     "帮我写个排序函数"}            │
+│ ]                                  │
+└────────────────────────────────────┘
+
+┌─ 路径 2（sideQuery 侧线）─────────┐
+│ POST /chat/completions             │
+│ messages: [                        │
+│   {role:"system", content:         │
+│     "你正在为AI编程助手选择记忆..." │
+│   },                               │
+│   {role:"user", content:           │
+│     "Query: 帮我写个排序函数\n\n"   │
+│     "Available memories:\n"        │
+│     "- [feedback] feedback_no_..." │
+│     "- [reference] reference_ci..."│
+│   }                                │
+│ ]                                  │
+└────────────────────────────────────┘
+```
+
+sideQuery 返回结果：
+
+```json
+{"selected_memories": ["feedback_no_type_annotations.md"]}
+```
+
+**（7）主循环消费预取结果**
+
+下一轮 API 调用前，检查 `memory_prefetch.settled == True`，将召回结果注入：
+
+```
+# 注入后的消息数组（最后一条 user 消息被增强）：
+
+messages = [
+  {role: "system", content: "你是Muse Code...\n\n## 当前记忆索引\n\n..."},
+  {role: "user", content: "帮我写个排序函数\n\n
+
+<system-reminder>
+Memory (saved today): ~/.muse/.../feedback_no_type_annotations.md:
+
+---
+name: 不使用类型注解和docstring
+type: feedback
+---
+**Why:** 用户认为Python...影响可读性。
+**How to apply:** 写Python代码时省略所有类型注解和docstring。
+</system-reminder>"},
+]
+```
+
+**（8）模型看到记忆并遵循偏好**
+
+```
+Muse Code
+def sort_users(users):
+    return sorted(users, key=lambda u: u.name)
+
+# ← 无类型注解、无 docstring，符合用户偏好
+```
+
+**（9）时效警告场景**
+
+如果记忆是 5 天前保存的，注入会附带 warning：
+
+```
+<system-reminder>
+This memory is 5 days old. Memories are point-in-time observations,
+not live state — descriptions of code behavior may be stale.
+Verify against current code before treating as fact.
+
+Memory: ~/.muse/.../project_auth_q3.md: ...
+
+---
+name: Q3认证迁移
+type: project
+---
+8月底前把登录模块从Session迁移到OAuth2
+</system-reminder>
+```
+
+模型看到警告字眼会意识到"这个信息可能过时了"，在遵循前主动验证。
+
+**（10）预算耗尽自动停止**
+
+当累计召回超过 60KB 后，后续查询不再触发预取：
+
+```
+# 假设之前已召回 4 条总计 68KB 的记忆（超额），
+# 再次输入 "帮我看看那个登录模块"
+# → start_memory_prefetch 检测 session_memory_bytes ≥ 60KB → 返回 None
+# → 不会再浪费 API 调用做无效召回
+```
+
+**（11）同会话去重**
+
+同一记忆在一个会话里只展示一次。用户多次问相关问题时不会反复看到：
+
+```python
+self._already_surfaced_memories = {
+    "/Users/../feedback_no_type_annotations.md",  # 已经注入过
+    "/Users/../reference_ci_dashboard.md",        # 已经注入过
+}
+# 下次查询候选会跳过这两条
+```
+```
+
+### 与 Claude Code / mini_claude 对比
+
+| 维度 | Claude Code | mini_claude | Muse Code |
+|------|------------|-------------|-----------|
+| 记忆类型 | 4 种封闭分类 | 4 种封闭分类 | 4 种封闭分类 |
+| 项目隔离 | 哈希 cwd | 哈希 cwd | 哈希 cwd |
+| 索引机制 | MEMORY.md 自动重建 | MEMORY.md 自动重建 | MEMORY.md 自动重建 |
+| 召回方式 | sideQuery + 异步预取 | sideQuery + 异步预取 | sideQuery + 异步预取 |
+| 时效警告 | 有 | 有 | 有（中文化） |
+| 双截断 | 200 行 + 25KB | 200 行 + 25KB | 200 行 + 25KB |
+| 单文件预算 | 4KB | 4KB | 4KB |
+| 会话预算 | 60KB | 60KB | 60KB |
+| 追加 thinking 召回 | 有 | 无 | 无 |
+| 多目录支持 | 有（org-level） | 无 | 无 |
+
+### 设计哲学
+
+1. **基于文件**：记忆 = `.md` 文件。任何编辑器能查、能改、能 git 管理，与 Agent 解耦。
+2. **封闭分类**：4 种类型，禁止自由标签——保证召回精度。
+3. **只记不可推导**：代码、git 历史、CLAUDE.md 已有的不要存。
+4. **双轨加载**：索引固定注入（让模型知道有什么）+ 详情按需召回（不污染上下文）。
+5. **零延迟召回**：异步预取与主调用并行，零阻塞。
+6. **会话级预算**：60KB 上限防止整个对话被记忆撑爆。
 
 ---
