@@ -1,7 +1,5 @@
 # 开发历史记录
 
-## 2026-06-07
-
 ## （1）feat：初始化项目，可以命令行启动极简版功能，只包含简单的模型调用和工具使用
 
 **提交:** `3e9e8d2` | **新增 9 个文件，共 332 行**
@@ -277,6 +275,7 @@
 - Git 上下文自动获取：当前分支、最近 5 条 commit、工作区状态
 - Agent 构造函数支持 `custom_system_prompt` 参数，可覆盖默认生成的提示
 
+---
 ## （4）feat：添加命令行参数体系、REPL 交互循环、会话持久化
 
 **核心内容**：从简单的主循环升级为完整的 CLI 工具，支持命令行参数、权限模式切换、会话保存/恢复、预算控制等。
@@ -1408,7 +1407,6 @@ self._already_surfaced_memories = {
 }
 # 下次查询候选会跳过这两条
 ```
-```
 
 ### 与 Claude Code / mini_claude 对比
 
@@ -1433,44 +1431,6 @@ self._already_surfaced_memories = {
 4. **双轨加载**：索引固定注入（让模型知道有什么）+ 详情按需召回（不污染上下文）。
 5. **零延迟召回**：异步预取与主调用并行，零阻塞。
 6. **会话级预算**：60KB 上限防止整个对话被记忆撑爆。
-
----
-
-## 腾讯workbuddy长期记忆系统设计参考
-
-腾讯的workbuddy的长期记忆系统包含四个核心维度：工作背景、个人背景、当前关注、近期动态。记忆系统会在每天晚上自动生成更新。
-
-### 完整示例：关于你的记忆
-
-**工作背景**
-用户是北邮背景的腾讯AI工程师（用户名lumxu），从事LLM微调的产品研发，同时是muse-code（CLI AI编码助手）项目的开发者。当前核心项目为TEN_Turn_Detection v3版本（VAD turn detection），采用LoRA微调（r=16+MLP层，学习率1e-4），分类标签为unfinished/wait/finished三分类，训练策略包含cost-sensitive loss、focal loss、label smoothing。训练集群为Karmada TKE（yunqing-finetuning-north-china），子集群cls-gzqq9xxu，finetuning-vad命名空间，使用run_fast_v2.sh脚本（6卡训练+2卡评估并行）。本地开发环境为macOS，训练集群home目录/data/home/lumxu。Docker镜像turn_detection_train:20260609-v1（23.7GB）。
-
-**个人背景**
-用户偏好中文交流，要求大白话式直白解释，简洁、行动导向，附明确命令块。通过@file引用文件+描述提供上下文，要求逐步调试指引+可直接复制运行的命令，实现后立即测试并附完整堆栈跟踪。偏好结构化表格输出，常生成架构/评估报告等MD文档。临时脚本执行后自删除，pipeline完成后写readme。对分类定义和根因敏感，追问澄清基础概念，排斥通用类比偏好领域示例。主动纠正助手错误假设，深入质疑设计理由，挑战错误逻辑。要求code_history.md关注设计决策和功能（不要实现细节），功能完成后要求commit message。
-
-**当前关注**
-1. TEN_Turn_Detection v3训练推进：6组实验设计全部rep=1、使用promptv2数据集，cost_matrix对unfinished偏好控制在w=[1,3]范围内，目标解决三分类任务类别不平衡问题。RTX4090 OOM已通过启用GRADIENT_CHECKPOINTING=1+降低batch至1解决。处理turtle soup数据集（qwen3标注，50w级）。
-2. K8s训练任务部署：NFS服务器30.167.128.221:/finetuning-vad容器内不可达，需直接在Job yaml中挂载NFS绕过PV/PVC；Karmada ClusterPropagationPolicy与kubectl apply冲突需先delete再apply。集群双网卡环境需设置hostNetwork=true利用eth1（30.x网段）绕过ENI-IP限制。
-3. GPU资源调度：27节点中20台GPU不足、18台ENI-IP不足，8卡RTX4090调度困难。
-4. muse-code memory system开发：参考mini_claude（/Users/lumxu/code/claude-code-from-scratch/python/mini_claude/）构建CLI AI编码助手核心记忆模块，关注设计决策记录。
-
-**近期动态**
-- 优化RTX4090训练OOM：启用GRADIENT_CHECKPOINTING=1，降低PER_DEVICE_BATCH至1。
-- 调试NFS存储连接：发现容器内无法访问NFS服务器，需Job yaml直接挂载NFS。
-- 处理Karmada部署冲突：采用先delete旧Job再create新Job的部署流程。
-- 调整VAD实验配置：6组实验E_rep*_w*使用promptv2数据集，w=[1,3]范围控制unfinished偏好。
-- 应对GPU资源短缺：排查节点GPU和ENI-IP不足问题。
-- 启动muse-code项目开发：搭建CLI AI编码助手项目框架，参考mini_claude实现。
-- 推进turtle soup数据集处理：qwen3标注，50w规模数据用于训练数据构建。
-- 优化交互调试流程：频繁粘贴终端输出请求调试，要求逐步操作指引和可执行命令块。
-
-### 设计要点
-
-1. **四维记忆结构**：工作背景、个人背景、当前关注、近期动态构成完整的用户画像
-2. **自动更新机制**：每天晚上自动生成更新，保持记忆的时效性
-3. **结构化存储**：每个维度都有明确的字段定义和更新策略
-4. **项目关联**：记忆与具体项目进展紧密关联，便于上下文理解
-5. **偏好记录**：详细记录用户的工作习惯和交流偏好，提升交互体验
 
 ---
 
@@ -1800,4 +1760,32 @@ messages = [
 6. **fork 留接口不强求**：subagent 模块还没好，先按 inline 跑；接口语义保留好，模块完工自动升级。
 
 ---
-这个记忆系统设计为muse-code的记忆模块开发提供了重要参考，特别是在用户画像构建和长期记忆管理方面。
+
+## 附录：腾讯 workbuddy 长期记忆系统设计参考
+
+这个记忆系统设计为 muse-code 的记忆模块开发提供了重要参考，特别是在用户画像构建和长期记忆管理方面。
+
+腾讯 workbuddy 的长期记忆系统包含四个核心维度：工作背景、个人背景、当前关注、近期动态。记忆系统会在每天晚上自动生成更新。
+
+### 完整示例：关于你的记忆
+
+**工作背景**
+用户是北邮背景的腾讯AI工程师（用户名lumxu），从事LLM微调的产品研发，同时是muse-code（CLI AI编码助手）项目的开发者。当前核心项目为TEN_Turn_Detection v3版本（VAD turn detection），采用LoRA微调（r=16+MLP层，学习率1e-4），分类标签为unfinished/wait/finished三分类，训练策略包含cost-sensitive loss、focal loss、label smoothing。训练集群为Karmada TKE（yunqing-finetuning-north-china），子集群cls-gzqq9xxu，finetuning-vad命名空间，使用run_fast_v2.sh脚本（6卡训练+2卡评估并行）。本地开发环境为macOS，训练集群home目录/data/home/lumxu。Docker镜像turn_detection_train:20260609-v1（23.7GB）。
+
+**个人背景**
+用户偏好中文交流，要求大白话式直白解释，简洁、行动导向，附明确命令块。偏好结构化表格输出，常生成架构/评估报告等MD文档。对分类定义和根因敏感，主动纠正助手错误假设，深入质疑设计理由。要求code_history.md关注设计决策和功能（不要实现细节），功能完成后要求commit message。
+
+**当前关注**
+muse-code 记忆系统、技能系统开发：参考 mini_claude 构建 CLI AI 编码助手的核心模块，关注设计决策记录。TEN_Turn_Detection v3 训练推进、K8s 训练任务部署、GPU 资源调度。
+
+**近期动态**
+- 启动muse-code项目开发：搭建CLI AI编码助手项目框架，参考mini_claude实现。
+- 持续推进上下文管理、记忆系统、技能系统模块开发。
+
+### 设计要点
+
+1. **四维记忆结构**：工作背景、个人背景、当前关注、近期动态构成完整的用户画像
+2. **自动更新机制**：每天晚上自动生成更新，保持记忆的时效性
+3. **结构化存储**：每个维度都有明确的字段定义和更新策略
+4. **项目关联**：记忆与具体项目进展紧密关联，便于上下文理解
+5. **偏好记录**：详细记录用户的工作习惯和交流偏好，提升交互体验
