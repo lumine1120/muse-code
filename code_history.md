@@ -695,7 +695,7 @@ result = check_permission("run_shell", {"command": "rm -rf /tmp"}, mode="default
 │  │  🔵 Layer 0:   truncate_result (>50K chars→截断)       │   │
 │  │  🔵 Layer 0.5: persist_large_result (>30KB→磁盘)      │   │
 │  │  🟡 Layer 1:   budget_trim (50%/70%双阈值)             │   │
-│  │  🟠 Layer 2:   snip (同文件去重，保留最近3个)           │   │
+│  │  🟡 Layer 2:   snip (同文件去重，保留最近3个)           │   │
 │  │  🟣 Layer 2.5: microcompact (5min空闲→激进清理)        │   │
 │  │  🔴 Layer 3:   auto_compact (85%窗口→LLM摘要)          │   │
 │  └──────────────────────────────────────────────────────┘   │
@@ -1250,7 +1250,7 @@ type: feedback
 ```markdown
 # Memory Index
 
-- **[不使用类型注解和docstring](feedback_no_type_annotations.md)** (feedback) — 用户偏好Pythonic代码，不需要类型注解和docstring
+- **[不使用类型注解和docstring](feedback_no_type_annotations.md)** (feedback) — 用户偏好...
 ```
 
 ```
@@ -1435,3 +1435,369 @@ self._already_surfaced_memories = {
 6. **会话级预算**：60KB 上限防止整个对话被记忆撑爆。
 
 ---
+
+## 腾讯workbuddy长期记忆系统设计参考
+
+腾讯的workbuddy的长期记忆系统包含四个核心维度：工作背景、个人背景、当前关注、近期动态。记忆系统会在每天晚上自动生成更新。
+
+### 完整示例：关于你的记忆
+
+**工作背景**
+用户是北邮背景的腾讯AI工程师（用户名lumxu），从事LLM微调的产品研发，同时是muse-code（CLI AI编码助手）项目的开发者。当前核心项目为TEN_Turn_Detection v3版本（VAD turn detection），采用LoRA微调（r=16+MLP层，学习率1e-4），分类标签为unfinished/wait/finished三分类，训练策略包含cost-sensitive loss、focal loss、label smoothing。训练集群为Karmada TKE（yunqing-finetuning-north-china），子集群cls-gzqq9xxu，finetuning-vad命名空间，使用run_fast_v2.sh脚本（6卡训练+2卡评估并行）。本地开发环境为macOS，训练集群home目录/data/home/lumxu。Docker镜像turn_detection_train:20260609-v1（23.7GB）。
+
+**个人背景**
+用户偏好中文交流，要求大白话式直白解释，简洁、行动导向，附明确命令块。通过@file引用文件+描述提供上下文，要求逐步调试指引+可直接复制运行的命令，实现后立即测试并附完整堆栈跟踪。偏好结构化表格输出，常生成架构/评估报告等MD文档。临时脚本执行后自删除，pipeline完成后写readme。对分类定义和根因敏感，追问澄清基础概念，排斥通用类比偏好领域示例。主动纠正助手错误假设，深入质疑设计理由，挑战错误逻辑。要求code_history.md关注设计决策和功能（不要实现细节），功能完成后要求commit message。
+
+**当前关注**
+1. TEN_Turn_Detection v3训练推进：6组实验设计全部rep=1、使用promptv2数据集，cost_matrix对unfinished偏好控制在w=[1,3]范围内，目标解决三分类任务类别不平衡问题。RTX4090 OOM已通过启用GRADIENT_CHECKPOINTING=1+降低batch至1解决。处理turtle soup数据集（qwen3标注，50w级）。
+2. K8s训练任务部署：NFS服务器30.167.128.221:/finetuning-vad容器内不可达，需直接在Job yaml中挂载NFS绕过PV/PVC；Karmada ClusterPropagationPolicy与kubectl apply冲突需先delete再apply。集群双网卡环境需设置hostNetwork=true利用eth1（30.x网段）绕过ENI-IP限制。
+3. GPU资源调度：27节点中20台GPU不足、18台ENI-IP不足，8卡RTX4090调度困难。
+4. muse-code memory system开发：参考mini_claude（/Users/lumxu/code/claude-code-from-scratch/python/mini_claude/）构建CLI AI编码助手核心记忆模块，关注设计决策记录。
+
+**近期动态**
+- 优化RTX4090训练OOM：启用GRADIENT_CHECKPOINTING=1，降低PER_DEVICE_BATCH至1。
+- 调试NFS存储连接：发现容器内无法访问NFS服务器，需Job yaml直接挂载NFS。
+- 处理Karmada部署冲突：采用先delete旧Job再create新Job的部署流程。
+- 调整VAD实验配置：6组实验E_rep*_w*使用promptv2数据集，w=[1,3]范围控制unfinished偏好。
+- 应对GPU资源短缺：排查节点GPU和ENI-IP不足问题。
+- 启动muse-code项目开发：搭建CLI AI编码助手项目框架，参考mini_claude实现。
+- 推进turtle soup数据集处理：qwen3标注，50w规模数据用于训练数据构建。
+- 优化交互调试流程：频繁粘贴终端输出请求调试，要求逐步操作指引和可执行命令块。
+
+### 设计要点
+
+1. **四维记忆结构**：工作背景、个人背景、当前关注、近期动态构成完整的用户画像
+2. **自动更新机制**：每天晚上自动生成更新，保持记忆的时效性
+3. **结构化存储**：每个维度都有明确的字段定义和更新策略
+4. **项目关联**：记忆与具体项目进展紧密关联，便于上下文理解
+5. **偏好记录**：详细记录用户的工作习惯和交流偏好，提升交互体验
+
+---
+
+## （8）feat：技能系统 — SKILL.md 发现 + 双路径调用 + 占位符模板
+
+> **一句话概括：** 给 Agent 加上"AI Shell 脚本"能力——把可复用的 prompt 模板封装成 `.claude/skills/<name>/SKILL.md`，用户通过 `/<name>` 显式触发，模型也能根据 `when_to_use` 自主调用 `skill` 工具。一次定义，反复使用。
+
+### 背景：为什么需要技能？
+
+每天和 Agent 打交道会发现很多任务"句式相同、参数不同"：
+
+- 提交代码：每次都要"看 diff → 写 commit message → 提交"
+- 代码审查：每次都要"读多个文件 → 检查规范 → 输出建议"
+- 生成 API 文档：每次都要"扫接口 → 整理参数 → 输出 markdown"
+
+把这些工作流复制粘贴 prompt 不优雅，写成函数又失去自然语言的灵活。**技能 = 自然语言写的、可复用的工作流脚本**。
+
+### 架构设计
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Skills System                          │
+│                                                          │
+│  发现来源（项目级覆盖用户级）：                            │
+│    ~/.claude/skills/<name>/SKILL.md   ← 用户级（低）      │
+│    ./.claude/skills/<name>/SKILL.md   ← 项目级（高）      │
+│                                                          │
+│  ┌──────────────────────────────────────────┐            │
+│  │  SKILL.md 格式                             │            │
+│  │  ─────────────                             │            │
+│  │  ---                                       │            │
+│  │  name: commit                              │            │
+│  │  description: 创建 git commit              │            │
+│  │  when_to_use: 用户要求提交代码时            │            │
+│  │  allowed-tools: run_shell, read_file       │            │
+│  │  user-invocable: true                      │            │
+│  │  context: inline                           │            │
+│  │  ---                                       │            │
+│  │  请查看当前 git diff...                    │            │
+│  │  用户诉求：$ARGUMENTS                       │            │
+│  │  技能目录：${CLAUDE_SKILL_DIR}              │            │
+│  └──────────────────────────────────────────┘            │
+│                                                          │
+│  双路径调用：                                              │
+│                                                          │
+│  ┌─ 路径 1: 用户主动 ──────┐  ┌─ 路径 2: 模型自动 ────┐    │
+│  │ /<name> <args>         │  │ skill 工具调用       │    │
+│  │  ↓                     │  │  ↓                   │    │
+│  │ __main__.py 拦截        │  │ tools.execute_tool   │    │
+│  │  ↓                     │  │  ↓                   │    │
+│  │ resolve_skill_prompt    │  │ resolve_skill_prompt │    │
+│  │  ↓                     │  │  ↓                   │    │
+│  │ agent.run(展开后prompt) │  │ 返回 prompt 作为     │    │
+│  │                        │  │ tool_result          │    │
+│  └────────────────────────┘  └─────────────────────┘     │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 核心设计点
+
+#### 1. 目录格式（不是单文件）
+
+```
+.claude/skills/
+├── commit/
+│   ├── SKILL.md           ← 必需，frontmatter + prompt 模板
+│   └── conventional_commits.md   ← 可选，附带资源文件
+├── review/
+│   └── SKILL.md
+└── api_docs/
+    ├── SKILL.md
+    └── template.md
+```
+
+为什么不用单文件 `commit.md`？技能经常需要附带资源（参考文档、示例数据）。目录格式天然支持，模板里用 `${CLAUDE_SKILL_DIR}/conventional_commits.md` 引用同目录文件即可。
+
+#### 2. 项目级覆盖用户级（用 dict 自然实现）
+
+```python
+def discover_skills():
+    skills: dict[str, SkillDefinition] = {}
+    _load_skills_from_dir(home / ".claude/skills", "user", skills)     # 先加载
+    _load_skills_from_dir(cwd / ".claude/skills", "project", skills)   # 后覆盖
+    return list(skills.values())
+```
+
+不需要写显式优先级判断——后写入的同名 key 自动覆盖。Claude Code 原版有 6 个来源（managed/project/user/plugin/bundled/MCP），我们简化为 2 个：覆盖了个人开发者最常用的"全局技能 + 项目特定技能"。
+
+#### 3. 双路径调用，最终汇合
+
+| 路径 | 触发方式 | 适用场景 |
+|------|---------|----------|
+| **路径 1：`/<name>`** | 用户在 REPL 显式输入 | 用户已知技能名，想精确触发 |
+| **路径 2：`skill` 工具** | 模型基于 `when_to_use` 自主判断 | 用户描述意图（"帮我提交代码"），模型自己识别 |
+
+两条路径都最终调用 `resolve_skill_prompt(skill, args)` 替换占位符——单一数据源，一处修改两处生效。
+
+#### 4. `skill` 是"元工具"（关键设计）
+
+普通工具返回数据（read_file 返回文件内容、grep_search 返回匹配行）。`skill` 工具返回的是**指令**——展开后的 prompt 文本。
+
+```python
+# tools.py — execute_tool 处理 skill 工具
+if name == "skill":
+    result_dict = execute_skill(skill_name, args)
+    return result_dict["prompt"]   # 返回 prompt 文本作为 tool_result
+```
+
+模型收到这段"工具结果"后，会按文本里的指令在下一轮执行。这种"工具返回 prompt"的设计让技能完全解耦于 Agent 框架——技能作者只写自然语言模板，不用懂工具调用机制。
+
+#### 5. 占位符替换（轻量模板引擎）
+
+模板里支持两个占位符：
+
+| 占位符 | 替换为 | 用途 |
+|--------|--------|------|
+| `$ARGUMENTS` / `${ARGUMENTS}` | 用户传入参数 | `/commit "fix login"` 时 `fix login` 注入到模板 |
+| `${CLAUDE_SKILL_DIR}` | 技能目录绝对路径 | `${CLAUDE_SKILL_DIR}/template.md` 引用同目录资源 |
+
+故意**不实现** `` !`shell` `` 内联执行：教学项目中安全风险大于价值，Claude Code 原版也对 MCP 技能禁用此特性防注入。
+
+#### 6. user-invocable 控制可见性
+
+```yaml
+user-invocable: false   # 用户不能 /name 调用，只有模型可自主触发
+```
+
+适用场景：内部辅助技能（如 `_validate_diff`），不希望出现在 `/skills` 列表里干扰用户视野，但模型在合适时机仍可通过 `skill` 工具调用。
+
+#### 7. allowed-tools 安全边界
+
+```yaml
+allowed-tools: run_shell, read_file
+# 或 JSON 数组语法（更严格）
+allowed-tools: ["run_shell", "read_file"]
+```
+
+技能只能使用白名单内的工具。当前 inline 模式不强制（依赖模型自觉），fork 模式预留了过滤接口——等 subagent 模块完成后即可启用真实隔离。
+
+#### 8. context: inline vs fork
+
+| 模式 | 行为 | 当前实现 |
+|------|------|---------|
+| **inline**（默认） | 展开 prompt 直接注入主对话 | ✅ 已实现 |
+| **fork** | 创建独立子 Agent 执行，只有最终结果回主对话 | 🟡 占位（subagent 模块未实现，退化为 inline） |
+
+fork 模式的价值：代码审查这类需要多次 read_file / grep_search 的技能，工具调用会污染主对话上下文。fork 之后只有 review 结论回到主线，主对话保持干净。等 subagent 模块完工就能无缝启用。
+
+#### 9. System Prompt 自动注入
+
+`build_skill_descriptions()` 把所有技能分两组写入系统提示：
+
+```
+# 可用技能
+
+用户可调用技能（用户输入 /<名称> 来调用）：
+- **/commit**: 创建一个git提交...
+  使用时机：当用户要求提交代码或说"commit"时
+- **/review**: 审查当前变更
+  使用时机：变更复杂或涉及核心模块时
+
+自动调用技能（在适当时使用 skill 工具）：
+- **api_docs**: 生成 API 文档
+  使用时机：用户要求文档或讨论接口设计时
+
+要以编程方式调用技能，请使用 `skill` 工具并传入技能名称和可选参数。
+```
+
+最后一句关键——告诉模型 "skill 工具" 这个能力存在。没有这句话模型不会主动调用。
+
+#### 10. 模块级缓存（启动时扫描一次）
+
+```python
+_cached_skills: list[SkillDefinition] | None = None
+
+def discover_skills():
+    if _cached_skills is not None:
+        return _cached_skills
+    # ... 扫描两个目录 ...
+    _cached_skills = list(skills.values())
+```
+
+技能内容会话期间几乎不变，每次都扫文件浪费。模块级缓存简单有效，热加载场景调 `reset_skill_cache()` 清空即可。
+
+### 文件变更
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `muse_code/skills.py` | **重写** | 完整技能系统（~220 行）：SkillDefinition、discover/parse/resolve/execute、build_skill_descriptions、缓存 |
+| `muse_code/tools.py` | 修改 | `execute_tool` 处理 `skill` 工具调用，返回展开后的 prompt 文本 |
+| `muse_code/agent.py` | 修改 | 工具过滤白名单去掉 `skill`（保留 `agent` 因为仍占位），让 skill 工具暴露给模型 |
+| `muse_code/__main__.py` | 修改 | 新增 `/skills` 命令 + `/<skill-name> args` 用户调用路径 |
+
+### 使用示例
+
+下面演示一次完整的"创建 → 用户调用 → 模型自动调用"流程。
+
+```bash
+# ── 第 1 步：创建一个 commit 技能 ──
+mkdir -p .claude/skills/commit
+cat > .claude/skills/commit/SKILL.md <<'EOF'
+---
+name: commit
+description: 创建一个git提交，自动撰写描述性的commit message
+when_to_use: 当用户要求提交代码或说"commit"时
+allowed-tools: run_shell, read_file
+user-invocable: true
+---
+请查看当前的 git diff 和暂存变更，按 conventional commits 格式
+撰写一个清晰简洁的 commit message。
+
+用户的具体诉求：$ARGUMENTS
+
+技能目录：${CLAUDE_SKILL_DIR}
+EOF
+```
+
+**System Prompt 自动包含技能描述：**
+
+```
+# 可用技能
+
+用户可调用技能（用户输入 /<名称> 来调用）：
+- **/commit**: 创建一个git提交，自动撰写描述性的commit message
+  使用时机：当用户要求提交代码或说"commit"时
+
+要以编程方式调用技能，请使用 `skill` 工具并传入技能名称和可选参数。
+```
+
+```
+# ── 第 2 步：用户主动调用（路径 1）──
+> /commit fix login bug
+调用技能: /commit
+
+# 内部流程：
+#   1. __main__.py 截获 / 命令
+#   2. resolve_skill_prompt(commit, "fix login bug")
+#      → "请查看当前的 git diff...
+#         用户的具体诉求：fix login bug
+#         技能目录：/path/to/.claude/skills/commit"
+#   3. 作为 user message 注入主对话
+#   4. agent.run(展开后的 prompt)
+
+Muse Code: 我先查看 git 状态。
+  🔧 run_shell git diff --staged
+  ...
+  
+Muse Code: 根据 diff，提交消息应该是...
+  🔧 run_shell git commit -m "fix(auth): handle expired token..."
+  ✓ 提交成功
+```
+
+```
+# ── 第 3 步：模型自动调用（路径 2）──
+> 帮我把这次的改动提交一下
+Muse Code: 好的，我使用 commit 技能来生成规范的 commit message。
+  🔧 skill {"skill_name": "commit", "args": "提交本次改动"}
+  
+  # tool_result 内容（即展开后的 prompt）：
+  # "请查看当前的 git diff 和暂存变更...
+  #  用户的具体诉求：提交本次改动
+  #  技能目录：/path/to/.claude/skills/commit"
+  
+  # 模型在下一轮 API 调用中按这段 prompt 行事：
+  🔧 run_shell git diff --staged
+  ...
+  🔧 run_shell git commit -m "..."
+```
+
+**`/skills` 命令查看所有技能：**
+
+```
+> /skills
+共 1 个技能：
+  /commit (project) — 创建一个git提交，自动撰写描述性的commit message
+```
+
+### 真实消息流（路径 2 模型自动调用）
+
+```python
+# user 输入"帮我把这次的改动提交一下"后的消息数组：
+
+messages = [
+  {role: "system", content: "...# 可用技能\n- **/commit**: 创建git提交..."},
+  {role: "user", content: "帮我把这次的改动提交一下"},
+  
+  # 模型决定调用 skill 工具：
+  {role: "assistant", content: None, tool_calls: [{
+      name: "skill",
+      arguments: '{"skill_name":"commit","args":"提交本次改动"}'
+  }]},
+  
+  # 工具结果是展开后的 prompt（不是数据）：
+  {role: "tool", tool_call_id: "...", content:
+      "请查看当前的 git diff 和暂存变更...\n"
+      "用户的具体诉求：提交本次改动\n"
+      "技能目录：/path/to/.claude/skills/commit"},
+  
+  # 模型按上面的 prompt 行事，下一轮调用 run_shell：
+  {role: "assistant", content: None, tool_calls: [{
+      name: "run_shell", arguments: '{"command":"git diff --staged"}'
+  }]},
+  ...
+]
+```
+
+### 与 Claude Code / mini_claude 对比
+
+| 维度 | Claude Code | mini_claude | Muse Code |
+|------|------------|-------------|-----------|
+| 加载来源 | 6 个（managed/project/user/plugin/bundled/MCP） | 2 个（user/project） | 2 个（user/project） |
+| 加载策略 | 启动只读 frontmatter，调用时读全文 | 启动全量加载 | 启动全量加载 + 模块级缓存 |
+| Token 预算 | `formatCommandsWithinBudget` 三阶段算法 | 无 | 无 |
+| 占位符 | `$ARGUMENTS`、`${CLAUDE_SKILL_DIR}`、`` !`shell` `` | 前两个 | 前两个 |
+| 双路径调用 | / + skill 工具 | / + skill 工具 | / + skill 工具 |
+| inline / fork | 都支持 | 都支持 | inline 完整、fork 占位 |
+| user-invocable | 支持 | 支持 | 支持 |
+| allowed-tools | 强制隔离 | inline 不隔离、fork 隔离 | inline 不隔离、fork 占位 |
+
+### 设计哲学
+
+1. **元工具思想**：`skill` 工具返回的是 prompt 不是数据。让技能作者只写自然语言，不用懂工具机制。
+2. **双路径单实现**：用户 `/name` 和模型 `skill` 工具最终汇合到 `resolve_skill_prompt`，单一数据源避免漂移。
+3. **目录优于文件**：技能可附带资源文件，`${CLAUDE_SKILL_DIR}` 提供可移植引用。
+4. **dict 自然覆盖**：用 dict[name] 的后写入覆盖语义实现优先级，比写显式 if-else 优雅。
+5. **缓存换性能**：技能会话期间不变，启动时扫描一次足够。
+6. **fork 留接口不强求**：subagent 模块还没好，先按 inline 跑；接口语义保留好，模块完工自动升级。
+
+---
+这个记忆系统设计为muse-code的记忆模块开发提供了重要参考，特别是在用户画像构建和长期记忆管理方面。

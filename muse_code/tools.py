@@ -502,7 +502,8 @@ def _truncate_result(result: str) -> str:
 
 
 # ─── 执行工具调用 ────────────────────────────────────
-# "agent" and "skill" tools are handled in agent.py to avoid circular deps.
+# agent 工具仍占位，由 agent.py 处理；skill 工具是"元工具"——
+# 返回展开后的 prompt 文本作为工具结果，模型在下一轮按此 prompt 执行。
 
 
 async def execute_tool(
@@ -536,6 +537,21 @@ async def execute_tool(
             if os.path.getmtime(abs_path) != read_file_state[abs_path]:
                 verb = "writing" if name == "write_file" else "editing"
                 return f"Warning: {inp['file_path']} was modified externally since your last read. Please read_file again before {verb}."
+
+    # 技能调用：返回展开后的 prompt 文本作为"指令"——模型在下一轮按此 prompt 行事。
+    # 这是个"元工具"：不返回数据，返回的是"接下来该做什么"。
+    if name == "skill":
+        from .skills import execute_skill
+        skill_name = inp.get("skill_name") or ""
+        args = inp.get("args") or ""
+        if not skill_name:
+            return "Error: skill_name is required"
+        result_dict = execute_skill(skill_name, args)
+        if result_dict is None:
+            return f"Error: skill '{skill_name}' not found. Use /skills in REPL to see available skills."
+        # 仅返回展开后的 prompt 文本；fork/inline 由调用方根据
+        # SkillDefinition.context 处理（当前实现统一 inline 注入）。
+        return result_dict["prompt"]
 
     # 工具搜索：激活延迟工具并返回它们的模式
     if name == "tool_search":

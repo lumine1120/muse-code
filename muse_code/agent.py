@@ -566,8 +566,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         async def _do():
             active_tools = get_active_tool_definitions()
             
-            # 过滤掉未实现的 MVP 工具，防止 API 错误
-            filtered_tools = [t for t in active_tools if t["name"] not in ("agent", "skill")]
+            # agent 工具仍然占位未实现，过滤；skill 工具已实现，保留。
+            filtered_tools = [t for t in active_tools if t["name"] != "agent"]
 
             create_params: dict[str, Any] = {
                 "model": self.model,
@@ -796,9 +796,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     async def _call_openai_stream(self) -> dict:
         async def _do():
-            # 先准备工具列表，过滤掉没实现的
+            # 先准备工具列表：agent 工具仍然占位未实现，过滤；skill 工具已实现，保留。
             active_tools = get_active_tool_definitions()
-            filtered_tools = [t for t in active_tools if t["name"] not in ("agent", "skill")]
+            filtered_tools = [t for t in active_tools if t["name"] != "agent"]
             
             # 调用 OpenAI API，开启流式
             stream = await self._openai_client.chat.completions.create(

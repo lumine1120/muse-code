@@ -205,6 +205,44 @@ async def run_repl(agent: Agent) -> None:
                     lines.append(f"  [{m.type}] {m.name} — {desc}")
                 ui.print_system("\n".join(lines))
             continue
+        if inp == "/skills":
+            from .skills import discover_skills
+            skills = discover_skills()
+            if not skills:
+                ui.print_system(
+                    "未找到任何技能。在 .claude/skills/<name>/SKILL.md 创建技能后即可使用。"
+                )
+            else:
+                lines = [f"共 {len(skills)} 个技能："]
+                for s in skills:
+                    tag = f"/{s.name}" if s.user_invocable else s.name
+                    desc = s.description or "(no description)"
+                    lines.append(f"  {tag} ({s.source}) — {desc}")
+                ui.print_system("\n".join(lines))
+            continue
+
+        # 用户主动触发技能：/<skill-name> [args]
+        # 注意要放在所有内置 / 命令之后，避免误吞 /clear、/cost 等
+        if inp.startswith("/") and len(inp) > 1:
+            from .skills import get_skill_by_name, resolve_skill_prompt
+            space_idx = inp.find(" ")
+            cmd_name = inp[1:space_idx] if space_idx > 0 else inp[1:]
+            cmd_args = inp[space_idx + 1:] if space_idx > 0 else ""
+            skill = get_skill_by_name(cmd_name)
+            if skill and skill.user_invocable:
+                ui.print_system(f"调用技能: /{skill.name}")
+                expanded = resolve_skill_prompt(skill, cmd_args)
+                # 将展开后的 prompt 作为 user message 注入主对话（inline 模式）。
+                # fork 模式需要 subagent 模块支持，当前退化为 inline。
+                try:
+                    await agent.run(expanded)
+                except Exception as e:
+                    if "abort" not in str(e).lower():
+                        ui.print_error(str(e))
+                continue
+            # 未匹配到技能时继续往下走，让用户得到"未知命令"反馈
+            ui.print_error(f"未知命令或技能：{inp}")
+            continue
 
         try:
             await agent.run(inp)
