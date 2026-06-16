@@ -1761,6 +1761,185 @@ messages = [
 
 ---
 
+## （9）feat：多 Agent 架构 — Sub-Agent fork-return 模式 + 内置/自定义 Agent 类型
+
+> **一句话概括：** 让主 Agent 能派生出独立的子 Agent（explore / plan / general / 自定义）去执行探索、规划、通用任务，子 Agent 在隔离上下文里跑完后只把"结论"返回主 Agent。这是处理复杂任务时最重要的"分而治之"机制，也补齐了技能系统遗留的 fork 占位。
+
+### 背景：为什么需要多 Agent？
+
+单 Agent 干所有事会遇到两个天花板：
+
+- **上下文污染**：一个"分析整个代码库架构"的任务可能要 read_file / grep_search 几十次，这些中间结果全堆在主对话里，挤占窗口又干扰后续推理。
+- **缺乏专精**：探索代码需要的是"快、只读、广撒网"，写代码需要的是"全工具、可改文件"。同一套提示词和工具集很难两头讨好。
+
+Sub-Agent 的思路：把一个可独立完成的子任务**分叉**给一个全新的 Agent 实例，它有自己的系统提示词、自己的工具集、自己的消息历史，跑完后只把最终文本结论回传主 Agent。主对话里只留下"派了个活、拿到个结论"，中间几十次工具调用都被隔离掉了。
+
+### 架构设计
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                   Multi-Agent System                      │
+│                                                          │
+│  用户请求 → 主 Agent                                       │
+│                │                                         │
+│                │ agent 工具调用 (type?)                    │
+│                ▼                                         │
+│        ┌───────┴────────┬─────────────┐                  │
+│        ▼                ▼             ▼                   │
+│   ┌─────────┐     ┌─────────┐   ┌──────────┐             │
+│   │ explore │     │  plan   │   │ general  │             │
+│   │ 只读·快 │     │只读·规划│   │ 完整工具 │             │
+│   └────┬────┘     └────┬────┘   └────┬─────┘             │
+│        │ 独立消息历史 + 独立工具集 + 独立系统提示词         │
+│        └────────────────┴─────────────┘                  │
+│                         │ 返回文本结论                    │
+│                         ▼                                │
+│                     主 Agent（token 汇总回父级）          │
+│                                                          │
+│  自定义 Agent：.claude/agents/*.md（项目级覆盖用户级）     │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 核心设计点
+
+#### 1. 子 Agent 就是"配置不同的 Agent 实例"（最关键洞察）
+
+没有为子 Agent 新写一套 loop，而是给 `Agent` 类加了三个可选参数：`custom_system_prompt`、`custom_tools`、`is_sub_agent`。同一套 agent loop（含双后端、流式、权限、上下文管理）原封不动地同时服务主 Agent 和子 Agent。`custom_tools` 为 `None` 时回退全量工具，对主 Agent 零侵入。
+
+这避免了"主从两套实现各跑各的、改一处忘一处"的经典陷阱。
+
+#### 2. 三种内置类型，工具集即能力边界
+
+| 类型 | 工具集 | 适用 |
+|------|--------|------|
+| **explore** | 只读（read_file / list_files / grep_search） | 快速代码库搜索、定位实现 |
+| **plan** | 只读 | 分析架构、产出结构化实现计划 |
+| **general** | 全量工具（**除 agent**） | 独立的多步任务，可改文件 |
+
+工具集本身就是最硬的能力约束——explore 拿不到 write_file，从根上就改不了文件，再叠加系统提示词的只读声明形成纵深防御。
+
+#### 3. 子 Agent 不能再派生子 Agent（防递归爆炸）
+
+general 的工具集里**显式过滤掉 `agent` 工具**。否则 A 派生 B、B 派生 C 的递归嵌套会指数级消耗 token——每一层都有自己的系统提示词和完整消息历史。实践中 1 层委托已覆盖绝大多数场景，Claude Code 也是同样的硬限制。
+
+#### 4. 输出捕获：buffer 三态
+
+主 Agent 的流式文本要逐字打印给用户看；子 Agent 的文本不能直接打到终端（会和主对话混在一起），得收集起来作为"结论"回传。用一个 `_output_buffer` 字段统一三态：
+
+- `None` = 主 Agent 模式 → 直接打印
+- `[]` = 子 Agent 开始收集
+- `[...]` = 正在积累
+
+流式回调只管调一个 `_emit_text()`，完全不感知自己在哪个模式下。生命周期边界清晰：`run_once` 开 buffer、loop 往里写、`run_once` 收集并关。比"传 onText 回调到处判断"侵入小得多。
+
+#### 5. agent 工具需要"有状态分发"
+
+普通工具走无状态的 `execute_tool(name, input)`。但 `agent` 工具要访问当前 Agent 实例的状态——model、permission_mode、token 计数器、后端配置（派生子 Agent 时要复用同一后端和密钥）。所以单独走 `_execute_tool_call`，`agent` 分发到实例方法，其余仍走无状态函数。
+
+#### 6. 权限继承：默认 bypass，但 Plan Mode 必须传染
+
+子 Agent 默认 `bypassPermissions`——主 Agent 派活时用户已经授权过了，子 Agent 每个工具再弹一次确认会很烦。**唯一例外**：主 Agent 在 Plan Mode 时，子 Agent 必须继承 `plan` 模式，否则子 Agent 能绕过只读限制去改文件，是个安全漏洞。
+
+#### 7. 容错：子 Agent 出错返回错误字符串，不抛异常
+
+子 Agent 跑挂了返回 `"Sub-agent error: ..."` 字符串而非抛出。父 Agent 的 LLM 看到这段错误信息后可以自行决定重试、换类型还是换策略——而不是整个主对话崩掉。这是 fork-return 模式"容错简单"优势的具体体现。
+
+#### 8. Token 汇总到父级
+
+子 Agent 的 token 用量按"运行后 − 运行前"的增量算出来，回传后通过 `_record_tokens` 累加进父 Agent。这样 `/cost` 看到的是含子 Agent 在内的总账，子 Agent 自己不打印费用（否则造成重复计费的错觉）。
+
+#### 9. 自定义 Agent：`.claude/agents/*.md`
+
+和技能、记忆共用 frontmatter 解析器与"项目级覆盖用户级"的 dict 发现机制：
+
+```markdown
+---
+name: reviewer
+description: Reviews code for bugs and style issues
+allowed-tools: read_file, list_files, grep_search
+---
+You are a code reviewer. Report bugs, style issues, and performance concerns.
+```
+
+声明了 `allowed-tools` 就按白名单给工具，没声明就给全量（仍排除 agent）。自定义类型的描述会注入系统提示词的 `# Custom Agent Types` 段落，让模型知道有这么个专家可派。
+
+#### 10. 顺带解锁了技能的 fork 模式
+
+技能系统（#8）里 `context: fork` 一直是占位，因为没有 subagent。现在 subagent 落地，fork 模式具备了真实落地的基础——代码审查这类"多次 read/grep"的技能可以 fork 出去跑，只把结论带回主线，主对话保持干净。
+
+### 文件变更
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `muse_code/subagent.py` | **重写** | 桩 → 完整实现：内置三类提示词、只读工具集、自定义 Agent 发现、`get_sub_agent_config`、`build_agent_descriptions`、缓存 |
+| `muse_code/agent.py` | 修改 | 构造函数加 `custom_tools` / `is_sub_agent`；新增 `_emit_text` / `run_once` / `_execute_agent_tool` / `_execute_tool_call`；两个后端**不再过滤 agent 工具**，按 buffer 状态门控终端输出 |
+| `muse_code/ui.py` | 修改 | 新增 `print_sub_agent_start` / `print_sub_agent_end`（magenta `┌─`/`└─` 标记） |
+
+`prompt.py`（已 import `build_agent_descriptions`）和 `permissions.py`（已处理 agent 工具确认 + bypassPermissions）无需改动——前序章节已埋好接口。
+
+### 使用示例
+
+```
+# ── 主 Agent 派生一个 explore 子 Agent 去定位实现 ──
+> 帮我搞清楚权限检查的核心逻辑在哪、怎么组织的
+
+  🤖 agent  定位权限检查逻辑
+
+  ┌─ Sub-agent [explore]: 定位权限检查逻辑
+  （子 Agent 内部跑了多次 grep_search / read_file，
+    这些工具调用都在隔离上下文里，不污染主对话）
+  └─ Sub-agent [explore] completed
+
+# 主 Agent 拿到子 Agent 的文本结论后，基于结论回答用户：
+Muse Code
+权限检查集中在 permissions.py 的 PermissionChecker.check()，9 步流水线：
+bypass → 规则 → 只读放行 → plan 限制 → ... 危险检测 + 白名单。
+入口在 agent.py 的工具执行前，详见 permissions.py:552。
+```
+
+```bash
+# ── 定义一个自定义 reviewer Agent ──
+mkdir -p .claude/agents
+cat > .claude/agents/reviewer.md <<'EOF'
+---
+name: reviewer
+description: 审查代码的 bug 与风格问题
+allowed-tools: read_file, list_files, grep_search
+---
+You are a code reviewer. Analyze thoroughly and report bugs,
+style inconsistencies, and performance concerns.
+EOF
+
+# System Prompt 自动包含：
+#   # Custom Agent Types
+#   - **reviewer**: 审查代码的 bug 与风格问题
+# 之后模型即可 agent(type="reviewer", ...) 派这个专家
+```
+
+### 与 Claude Code / mini_claude 对比
+
+| 维度 | Claude Code | mini_claude | Muse Code |
+|------|------------|-------------|-----------|
+| 协作模式 | Sub-Agent / Coordinator / Swarm | Sub-Agent | Sub-Agent（fork-return） |
+| 执行流程 | 5 阶段（fork 进程、缓存共享） | new Agent + runOnce | new Agent + run_once（复用双后端 loop） |
+| 工具过滤 | 4 层管道 | 1 个 Set + filter | 工具集即边界 + general 排除 agent |
+| Explore 模型 | Haiku（更便宜） | 统一主模型 | 统一主模型 |
+| 上下文隔离 | deny-by-default | 天然隔离（独立实例） | 天然隔离（独立实例 + 独立消息历史） |
+| Worktree 隔离 | 每个写 Agent 独立 worktree | 无 | 无 |
+| 自定义 Agent | `.claude/agents/*.md` | `.claude/agents/*.md` | `.claude/agents/*.md` |
+| 递归派生 | 禁止 | 禁止 | 禁止（general 排除 agent） |
+
+### 设计哲学
+
+1. **子 Agent = 配置不同的 Agent 实例**：靠三个可选参数复用整套 loop，拒绝主从两份实现。
+2. **工具集即能力边界**：能不能改文件，由拿没拿到 write_file 决定，比提示词约束更硬。
+3. **fork-return 优于 Coordinator 作为起点**：无共享状态、控制流确定、容错简单——子 Agent 挂了主 Agent 照常工作。
+4. **上下文隔离换主对话整洁**：几十次中间工具调用留在子 Agent 里，主对话只见结论。
+5. **权限默认放行但 Plan Mode 传染**：减少打扰，同时堵住只读绕过的安全漏洞。
+6. **埋好的接口逐章兑现**：prompt / permissions / 技能 fork 在前几章预留的接口，到这一章一次性兑现。
+
+---
+
 ## 附录：腾讯 workbuddy 长期记忆系统设计参考
 
 这个记忆系统设计为 muse-code 的记忆模块开发提供了重要参考，特别是在用户画像构建和长期记忆管理方面。

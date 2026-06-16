@@ -30,6 +30,7 @@ from .memory import (
     format_memories_for_injection,
     MemoryPrefetch,
 )
+from .subagent import get_sub_agent_config
 
 def _is_retryable(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
@@ -77,6 +78,8 @@ class Agent:
         api_base: str | None = None,
         anthropic_base_url: str | None = None,
         custom_system_prompt: str | None = None,
+        custom_tools: list[dict] | None = None,
+        is_sub_agent: bool = False,
         confirm_fn: Callable[[str], Awaitable[bool]] | None = None,
     ):
         self.ui = ui
@@ -87,6 +90,14 @@ class Agent:
         self._aborted = False
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
         self.confirm_fn = confirm_fn  # 外部确认回调
+
+        # ─── 子 Agent 支持 ────────────────────────
+        # custom_tools 为 None 时回退到全量工具列表，对主 Agent 零侵入。
+        self.is_sub_agent = is_sub_agent
+        self._custom_tools = custom_tools
+        # _output_buffer 三态：None=主 Agent（直接打印）；[]=子 Agent（开始收集）；
+        # [...]=正在积累。流式回调只需调 _emit_text，完全不感知自己在哪个模式下。
+        self._output_buffer: list[str] | None = None
 
         # 会话追踪
         self._session_id = new_session_id()
@@ -105,6 +116,11 @@ class Agent:
         # 自动判断后端
         backend = os.getenv("MUSE_BACKEND", "openai").lower()
         self.use_openai = (backend != "anthropic")
+
+        # 保存后端配置，供派生子 Agent 时复用
+        self._api_key = api_key
+        self._api_base = api_base
+        self._anthropic_base_url = anthropic_base_url
 
         # Read-before-edit state matching
         self._read_file_state: dict[str, float] = {}
@@ -146,6 +162,91 @@ class Agent:
     def abort(self) -> None:
         self._aborted = True
 
+    # ─── 子 Agent：输出捕获与执行 ──────────────────────────
+
+    def _emit_text(self, text: str) -> None:
+        """流式文本去向的统一出口。
+
+        子 Agent 模式（_output_buffer 不为 None）：收集到 buffer，最终由 run_once 返回；
+        主 Agent 模式：直接逐字打印到终端。
+        """
+        if self._output_buffer is not None:
+            self._output_buffer.append(text)
+        else:
+            self.ui.console.print(text, end="")
+
+    async def run_once(self, prompt: str) -> dict:
+        """子 Agent 的一次性执行入口：复用完整 agent loop，收集输出并返回。
+
+        Token 用增量计算（运行后 - 运行前），因为 Agent 实例的计数器是累积的。
+        chat 逻辑完全复用，它不关心自己在主 Agent 还是子 Agent 中 ——
+        工具集和输出去向已在构造函数里配置好。
+        """
+        self._output_buffer = []
+        prev_in = self._total_input_tokens
+        prev_out = self._total_output_tokens
+        try:
+            if self.use_openai:
+                await self._chat_openai(prompt)
+            else:
+                await self._chat_anthropic(prompt)
+            text = "".join(self._output_buffer)
+        finally:
+            self._output_buffer = None
+        return {
+            "text": text,
+            "tokens": {
+                "input": self._total_input_tokens - prev_in,
+                "output": self._total_output_tokens - prev_out,
+            },
+        }
+
+    async def _execute_agent_tool(self, inp: dict) -> str:
+        """执行 agent 工具：派生一个独立的子 Agent，运行后把结果返回主 Agent。
+
+        子 Agent 拥有独立的消息历史（天然上下文隔离），出错时返回错误字符串
+        而非抛出，让父 Agent 的 LLM 自行决定重试或换策略。
+        """
+        agent_type = inp.get("type") or "general"
+        description = inp.get("description", "sub-agent task")
+        prompt = inp.get("prompt", "")
+
+        self.ui.print_sub_agent_start(agent_type, description)
+
+        config = get_sub_agent_config(agent_type)
+        # 权限继承：子 Agent 默认 bypassPermissions（主 Agent 已授权，子 Agent 不必再问），
+        # 但 Plan Mode 必须继承 —— 否则子 Agent 可绕过只读限制，是安全漏洞。
+        sub_permission_mode = "plan" if self.permission_mode == "plan" else "bypassPermissions"
+
+        sub_agent = Agent(
+            ui=self.ui,
+            permission_mode=sub_permission_mode,
+            model=self.model,
+            custom_system_prompt=config["system_prompt"],
+            custom_tools=config["tools"],
+            is_sub_agent=True,
+            api_key=self._api_key,
+            api_base=self._api_base,
+            anthropic_base_url=self._anthropic_base_url,
+        )
+
+        try:
+            result = await sub_agent.run_once(prompt)
+            # token 汇总到父 Agent（子 Agent 自身不打印费用，避免重复计费的错觉）
+            self._record_tokens(result["tokens"]["input"], result["tokens"]["output"])
+            self.ui.print_sub_agent_end(agent_type)
+            return result["text"] or "(Sub-agent produced no output)"
+        except Exception as e:
+            self.ui.print_sub_agent_end(agent_type)
+            return f"Sub-agent error: {e}"
+
+    async def _execute_tool_call(self, name: str, inp: dict) -> str:
+        """工具分发：agent 工具需要访问当前 Agent 实例状态（model、permission_mode、
+        token 计数器、后端配置），无法走无状态的 execute_tool，因此单独分发。"""
+        if name == "agent":
+            return await self._execute_agent_tool(inp)
+        return await execute_tool(name, inp, self._read_file_state)
+
     def restore_session(self, session: dict[str, Any]) -> None:
         """从保存的会话数据恢复消息历史和白名单"""
         meta = session.get("metadata", {})
@@ -159,7 +260,7 @@ class Agent:
         else:
             self._anthropic_messages = session.get("anthropicMessages", self._anthropic_messages)
 
-        # 恢复白名单
+        # 恢复白名单，从session里面提取纪录了哪些操作是确认过的安全操作。
         whitelist_data = session.get("whitelist")
         if whitelist_data:
             from .permissions import SessionWhitelist
@@ -545,7 +646,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         self._confirmed_paths.add(whitelist_id)
                         self._permission_checker.confirm(tu.name, whitelist_id)
 
-                res = await execute_tool(tu.name, inp, self._read_file_state)
+                res = await self._execute_tool_call(tu.name, inp)
                 self.ui.print_tool_result(res)
                 tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
 
@@ -564,10 +665,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     async def _call_anthropic_stream(self, on_tool_block_complete=None):
         async def _do():
-            active_tools = get_active_tool_definitions()
-            
-            # agent 工具仍然占位未实现，过滤；skill 工具已实现，保留。
-            filtered_tools = [t for t in active_tools if t["name"] != "agent"]
+            # 子 Agent 用构造时注入的受限工具集；主 Agent 用全量激活工具（含 agent）。
+            if self._custom_tools is not None:
+                filtered_tools = get_active_tool_definitions(self._custom_tools)
+            else:
+                filtered_tools = get_active_tool_definitions()
 
             create_params: dict[str, Any] = {
                 "model": self.model,
@@ -598,11 +700,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     elif event.type == "content_block_delta":
                         delta = event.delta
                         if hasattr(delta, 'text'):
-                            # 是文本！直接打印到终端（用户马上就能看到回答）
+                            # 是文本！主 Agent 直接打印，子 Agent 收集到 buffer。
                             if first_text:
-                                self.ui.console.print("\n[bold purple]Muse Code[/bold purple]")
+                                if self._output_buffer is None:
+                                    self.ui.console.print("\n[bold purple]Muse Code[/bold purple]")
                                 first_text = False
-                            self.ui.console.print(delta.text, end="")  # end="" 不换行，逐字输出
+                            self._emit_text(delta.text)
                             full_text += delta.text
                         elif hasattr(delta, 'partial_json'):
                             # 是工具调用的参数 JSON，还没传完，先拼起来
@@ -624,7 +727,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                 "name": tb["name"], "input": parsed,
                             })
 
-                if not first_text:
+                if not first_text and self._output_buffer is None:
                     self.ui.console.print()
                 return await stream.get_final_message()
         return await _with_retry(_do)
@@ -751,7 +854,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         if not ct["allowed"]:
                             self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
                             continue
-                        res = await execute_tool(ct["fn"], ct["inp"], self._read_file_state)
+                        res = await self._execute_tool_call(ct["fn"], ct["inp"])
                         self.ui.print_tool_result(res)
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
 
@@ -796,9 +899,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     async def _call_openai_stream(self) -> dict:
         async def _do():
-            # 先准备工具列表：agent 工具仍然占位未实现，过滤；skill 工具已实现，保留。
-            active_tools = get_active_tool_definitions()
-            filtered_tools = [t for t in active_tools if t["name"] != "agent"]
+            # 子 Agent 用构造时注入的受限工具集；主 Agent 用全量激活工具（含 agent）。
+            if self._custom_tools is not None:
+                filtered_tools = get_active_tool_definitions(self._custom_tools)
+            else:
+                filtered_tools = get_active_tool_definitions()
             
             # 调用 OpenAI API，开启流式
             stream = await self._openai_client.chat.completions.create(
@@ -827,12 +932,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     continue
                 delta = chunk.choices[0].delta
 
-                # (1) 文本内容来了！直接打印
+                # (1) 文本内容来了！主 Agent 直接打印，子 Agent 收集到 buffer。
                 if delta and delta.content:
                     if first_text:
-                        self.ui.console.print("\n[bold purple]Muse Code[/bold purple]")
+                        if self._output_buffer is None:
+                            self.ui.console.print("\n[bold purple]Muse Code[/bold purple]")
                         first_text = False
-                    self.ui.console.print(delta.content, end="")  # end="" 逐字输出
+                    self._emit_text(delta.content)
                     content += delta.content
 
                 # (2) 工具调用内容来了！拼起来
@@ -853,8 +959,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 # (3) 收到 finish_reason，记录下来
                 if chunk.choices[0].finish_reason:
                     finish_reason = chunk.choices[0].finish_reason
-            # 流式结束，换行
-            if not first_text:
+            # 流式结束，换行（仅主 Agent 终端输出需要）
+            if not first_text and self._output_buffer is None:
                 self.ui.console.print()
             # 组装完整的响应对象
             assembled = None

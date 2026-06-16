@@ -122,3 +122,13 @@ class UI:
         """打印白名单添加提示"""
         preview = identifier[:60] + "..." if len(identifier) > 60 else identifier
         self.console.print(f"  [dim green]✓ 已加入会话白名单: {preview}[/dim green]")
+
+    # ─── 子 Agent 展示 ──────────────────────────────────────
+
+    def print_sub_agent_start(self, agent_type: str, description: str):
+        """打印子 Agent 启动提示"""
+        self.console.print(f"\n  [magenta]┌─ Sub-agent [{agent_type}]: {description}[/magenta]")
+
+    def print_sub_agent_end(self, agent_type: str):
+        """打印子 Agent 完成提示"""
+        self.console.print(f"  [magenta]└─ Sub-agent [{agent_type}] completed[/magenta]")
