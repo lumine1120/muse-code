@@ -1940,6 +1940,184 @@ EOF
 
 ---
 
+## （10）feat：MCP 集成 — 原始 JSON-RPC over stdio 连接外部工具服务器
+
+> **一句话概括：** 让 Agent 动态加载外部工具——连数据库、Slack、GitHub 等服务，只需在配置文件里声明一个服务器地址，不改一行源码。对 Agent Loop 来说，MCP 工具和内置工具没有任何区别：都是名字 + schema + 执行函数。
+
+### 背景：为什么需要 MCP？
+
+到上一章为止，Agent 的工具是**写死在代码里**的——read_file、grep_search、run_shell 等十来个。但真实场景下用户的需求五花八门：有人要查 Postgres，有人要发 Slack 消息，有人要操作 GitHub Issue。把这些全塞进内置工具既不现实（依赖爆炸）也不优雅（大部分用户用不到）。
+
+MCP（Model Context Protocol）是 Anthropic 发布的开放协议，专门解决这个问题：**工具的提供方（server）和使用方（client）解耦**。任何人都能写一个 MCP server 暴露一组工具，Agent 只要按协议连上去就能用。生态里已经有现成的 filesystem、github、slack、postgres 等官方 server，`npx` 一行就能起。
+
+### 架构设计
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                      MCP System                           │
+│                                                          │
+│  配置发现（三处合并，同名后读覆盖）：                       │
+│    ~/.claude/settings.json   ← 用户级                    │
+│    ./.claude/settings.json   ← 项目级                    │
+│    ./.mcp.json               ← 项目根（扁平格式）         │
+│                    │                                     │
+│                    ▼                                     │
+│              ┌───────────┐                               │
+│              │ McpManager│                               │
+│              └─────┬─────┘                               │
+│         spawn 子进程 + stdio                              │
+│        ┌───────────┴───────────┐                         │
+│        ▼                       ▼                         │
+│  ┌───────────┐           ┌───────────┐                   │
+│  │ Server A  │           │ Server B  │                   │
+│  │(McpConn)  │           │(McpConn)  │                   │
+│  └─────┬─────┘           └─────┬─────┘                   │
+│   JSON-RPC over stdin/stdout                             │
+│        │                       │                         │
+│  mcp__A__tool1           mcp__B__tool3                   │
+│  mcp__A__tool2                                           │
+│        └───────────┬───────────┘                         │
+│                    ▼ 透明注入                            │
+│               Agent Loop                                 │
+│                    │ tool_use: mcp__A__tool1             │
+│                    ▼ 按前缀路由                          │
+│               McpManager → Server A                      │
+└──────────────────────────────────────────────────────────┘
+```
+
+核心流程一句话：**spawn 子进程 → JSON-RPC 握手 → 发现工具 → 前缀注册 → 透明路由**。
+
+### 核心设计点
+
+#### 1. JSON-RPC over stdio，不用 HTTP
+
+每个 MCP server 是一个**子进程**，client 通过它的 stdin/stdout 收发换行分隔的 JSON-RPC 消息。为什么不用 HTTP？stdio 的优势是**零配置**：不用管端口、不用服务发现、进程生命周期自动绑定父进程——父进程退出，子进程跟着走，pending 请求自动 reject，不存在连接泄漏。HTTP 方案要处理端口冲突、心跳、进程发现，复杂度高一个量级。stdio 覆盖了 95% 的场景。
+
+#### 2. 不依赖 MCP SDK，手写 ~60 行 JSON-RPC
+
+`@anthropic-ai/sdk` 有现成的 MCP 客户端封装，但我们直接实现原始 JSON-RPC。两个好处：**零依赖**（不增包体积）和**教学价值**（读者能看到协议的完整细节）。整个通信就两种消息：
+
+| 消息类型 | 有无 id | 行为 |
+|---------|---------|------|
+| **请求（request）** | 有 | 写入 stdin，存入 `pending` 表等响应配对 |
+| **通知（notification）** | 无 | 写入 stdin 就结束，发后不管 |
+
+`pending: dict[id → Future]` 用自增 id 关联请求和响应：发送时存入 Future，后台读循环收到带相同 id 的响应就 resolve/reject。
+
+#### 3. 三步标准流程：initialize → tools/list → tools/call
+
+```
+initialize（协商协议版本 2024-11-05、交换能力）
+   ↓
+notifications/initialized（协议强制：告诉 server 客户端就绪）
+   ↓
+tools/list（发现 server 提供哪些工具）
+   ↓
+tools/call（实际调用，返回 {content:[{type:"text",text:...}]}）
+```
+
+`call_tool` 只提取 `content` 里 `type == "text"` 的部分拼接返回——图片等其他类型暂不处理。
+
+#### 4. 三段式前缀名 `mcp__server__tool`（一名解两题）
+
+filesystem server 的 `read_file` 工具，注册成 `mcp__filesystem__read_file`。这个命名同时解决两个问题：
+
+- **避免冲突**：不同 server 可能有同名工具（两个 server 都有 `read_file`）
+- **嵌入路由信息**：从名字直接拆出 server 名，不需要额外映射表
+
+路由时 `split("__")` 取第 2 段作 server 名，`"__".join(parts[2:])` 还原工具名（容错工具名本身含 `__`）。Claude Code 用的是完全相同的命名方案。
+
+#### 5. 懒加载：首次 chat 时才连接
+
+MCP 连接不在构造函数里做，而是**首次 `run()` 时**触发。理由：用户可能只是想问一句"这个函数啥意思"，根本用不到外部工具，没必要付连接的启动成本（npx 起 server 可能要好几秒）。代价是第一次用到时有一次性延迟，但只发生一次。
+
+#### 6. 只在主 Agent 连接，子 Agent 跳过
+
+子 Agent（上一章）不连 MCP——它要么继承受限工具集（explore/plan），要么就是临时任务。`_ensure_mcp_loaded()` 里一个 `is_sub_agent` 判断直接返回，避免每派生一个子 Agent 就重连一遍 server。
+
+#### 7. 容错：失败静默跳过，绝不崩溃
+
+每台 server 独立连接，握手和工具发现各有 **15 秒超时**（npx 首次要下载包，但不能无限等）。某台连不上？打条日志、`close()` 清理、继续连下一台。MCP 整体挂了？Agent 照常用内置工具工作。`_execute_tool_call` 里 MCP 调用出错也包装成字符串返回给模型，而不是抛异常中断主循环。
+
+#### 8. 退出时清理子进程
+
+REPL 退出时调 `disconnect_all()` kill 掉所有 server 子进程，避免僵尸进程。`close()` 同时 reject 所有 pending 请求，让等待中的 `await` 干净地失败。
+
+#### 9. 修正参考实现的一处竞态
+
+mini_claude 的 `_send_request` 是**先写 stdin 再注册 pending future**。如果 server 响应极快（在注册前就返回），读循环会因为 `pending` 里还没有这个 id 而把响应丢弃，请求永久挂起。Muse Code 改成**先注册 future 再写 stdin**，消除这个竞态。
+
+### 文件变更
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `muse_code/mcp.py` | **新建** | 完整 MCP 客户端（~290 行）：`McpConnection`（子进程 + JSON-RPC 收发握手）、`McpManager`（配置合并、连接生命周期、前缀注册、路由） |
+| `muse_code/agent.py` | 修改 | 构造函数加 MCP 状态；`run()` 首次调用懒加载（仅主 Agent）；两后端工具列表追加 MCP 工具；`_execute_tool_call` 按 `mcp__` 前缀路由 |
+| `muse_code/__main__.py` | 修改 | REPL 退出时 `disconnect_all()` 清理子进程 |
+
+`permissions.py` 无需改动——MCP 工具不在 `CONCURRENCY_SAFE_TOOLS` 里，总是走串行执行路径（经 `_execute_tool_call` 路由），权限上落到默认放行分支，符合教学范围。
+
+### 配置示例
+
+```json
+// .mcp.json（项目根目录）或 ~/.claude/settings.json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_xxx" }
+    }
+  }
+}
+```
+
+### 使用示例
+
+```
+# ── 启动时自动连接配置好的 server ──
+$ python -m muse_code
+[mcp] Connected to 'filesystem' — 8 tools
+[mcp] Connected to 'github' — 26 tools
+
+# ── 模型可直接调用 MCP 工具（与内置工具无异）──
+> 看看 /tmp 下有哪些文件
+
+  🛠️ mcp__filesystem__list_directory  {"path": "/tmp"}
+  （McpManager 拆出 server="filesystem"、tool="list_directory"，
+    转发到对应子进程，返回的 text 内容回到主对话）
+
+Muse Code
+/tmp 下有 build/、cache/、test.log 三项。
+```
+
+### 与 Claude Code / mini_claude 对比
+
+| 维度 | Claude Code | mini_claude | Muse Code |
+|------|------------|-------------|-----------|
+| MCP SDK | `@anthropic-ai/sdk` 内置客户端 | 原始 JSON-RPC | 原始 JSON-RPC（无 SDK 依赖） |
+| 传输协议 | stdio + SSE | 仅 stdio | 仅 stdio |
+| 工具发现 | 动态刷新（server 可通知变更） | 一次性发现 | 一次性发现 |
+| 配置来源 | settings.json + .mcp.json + 企业策略 | settings.json + .mcp.json | settings.json + .mcp.json |
+| 错误处理 | 重试 + 降级 | 静默跳过 | 静默跳过 + 修正发送竞态 |
+| 连接时机 | 首次 chat 懒加载 | 首次 chat 懒加载 | 首次 run 懒加载 |
+| 子 Agent | 独立 MCP 连接 | 不连接 | 不连接（is_sub_agent 跳过） |
+
+### 设计哲学
+
+1. **工具即协议，提供方与使用方解耦**：MCP 让工具能在 Agent 之外独立演进，不改源码即可扩展能力。
+2. **stdio 优于 HTTP 作为传输**：进程生命周期自动绑定，零端口管理，无连接泄漏。
+3. **三段式前缀一名解两题**：命名冲突 + 路由信息一次解决，无需额外映射表。
+4. **懒加载换零开销**：用不到 MCP 的快问快答场景一点不付出启动成本。
+5. **透明注入**：MCP 工具对 Agent Loop 完全透明，模型不知道也不需要知道工具来自外部进程。
+6. **失败不传染**：单台 server 挂掉、超时、出错都被隔离，Agent 永远能用内置工具兜底。
+
+---
+
 ## 附录：腾讯 workbuddy 长期记忆系统设计参考
 
 这个记忆系统设计为 muse-code 的记忆模块开发提供了重要参考，特别是在用户画像构建和长期记忆管理方面。

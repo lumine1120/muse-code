@@ -31,6 +31,7 @@ from .memory import (
     MemoryPrefetch,
 )
 from .subagent import get_sub_agent_config
+from .mcp import McpManager
 
 def _is_retryable(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
@@ -159,6 +160,13 @@ class Agent:
         self._pre_plan_mode: str | None = None
         self._plan_file_path: str | None = None
 
+        # ─── MCP 集成 ──────────────────────────────
+        # 懒加载：首次 run() 时才连接服务器（用户可能只想问个快问题，不必付连接成本）。
+        # 子 Agent 不连接，继承主 Agent 的工具列表即可。
+        self._mcp_manager = McpManager()
+        self._mcp_initialized = False
+        self._mcp_tool_defs: list[dict] = []
+
     def abort(self) -> None:
         self._aborted = True
 
@@ -242,9 +250,15 @@ class Agent:
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
         """工具分发：agent 工具需要访问当前 Agent 实例状态（model、permission_mode、
-        token 计数器、后端配置），无法走无状态的 execute_tool，因此单独分发。"""
+        token 计数器、后端配置），无法走无状态的 execute_tool，因此单独分发。
+        MCP 工具按 mcp__ 前缀转发到对应服务器。"""
         if name == "agent":
             return await self._execute_agent_tool(inp)
+        if self._mcp_manager.is_mcp_tool(name):
+            try:
+                return await self._mcp_manager.call_tool(name, inp)
+            except Exception as e:
+                return f"MCP tool error: {e}"
         return await execute_tool(name, inp, self._read_file_state)
 
     def restore_session(self, session: dict[str, Any]) -> None:
@@ -537,6 +551,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self.ui.print_system(budget["reason"])
             return
 
+        # MCP 懒加载：首次对话时连接服务器并把工具暴露给模型。
+        # 只在主 Agent 加载；失败只输出日志，不影响内置工具继续工作。
+        await self._ensure_mcp_loaded()
+
         try:
             if self.use_openai:
                 await self._chat_openai(user_message)
@@ -544,6 +562,17 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 await self._chat_anthropic(user_message)
         finally:
             self._auto_save()
+
+    async def _ensure_mcp_loaded(self) -> None:
+        """首次调用时连接所有 MCP 服务器，发现工具。幂等且对子 Agent 跳过。"""
+        if self._mcp_initialized or self.is_sub_agent:
+            return
+        self._mcp_initialized = True
+        try:
+            await self._mcp_manager.load_and_connect()
+            self._mcp_tool_defs = self._mcp_manager.get_tool_definitions()
+        except Exception as e:
+            print(f"[mcp] Init failed: {e}", flush=True)
 
     # ─── Anthropic backend ───────────────────────────────────────
 
@@ -669,7 +698,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._custom_tools is not None:
                 filtered_tools = get_active_tool_definitions(self._custom_tools)
             else:
-                filtered_tools = get_active_tool_definitions()
+                # 主 Agent：内置激活工具 + 已发现的 MCP 工具
+                filtered_tools = get_active_tool_definitions() + self._mcp_tool_defs
 
             create_params: dict[str, Any] = {
                 "model": self.model,
@@ -903,8 +933,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._custom_tools is not None:
                 filtered_tools = get_active_tool_definitions(self._custom_tools)
             else:
-                filtered_tools = get_active_tool_definitions()
-            
+                # 主 Agent：内置激活工具 + 已发现的 MCP 工具
+                filtered_tools = get_active_tool_definitions() + self._mcp_tool_defs
+
             # 调用 OpenAI API，开启流式
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,

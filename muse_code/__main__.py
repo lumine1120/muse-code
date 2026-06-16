@@ -250,6 +250,9 @@ async def run_repl(agent: Agent) -> None:
             if "abort" not in str(e).lower():
                 ui.print_error(str(e))
 
+    # 退出 REPL：清理 MCP 子进程，避免僵尸进程
+    await agent._mcp_manager.disconnect_all()
+
 
 if __name__ == "__main__":
     main()
