@@ -137,13 +137,11 @@ tool_definitions: list[ToolDef] = [
         "name": "enter_plan_mode",
         "description": "进入计划模式以切换到只读的计划阶段。在计划模式下，只能读取文件并写入计划文件。",
         "input_schema": {"type": "object", "properties": {}},
-        "deferred": True,
     },
     {
         "name": "exit_plan_mode",
         "description": "在写完计划文件后退出计划模式。",
         "input_schema": {"type": "object", "properties": {}},
-        "deferred": True,
     },
     {
         "name": "agent",

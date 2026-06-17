@@ -151,8 +151,8 @@ class Agent:
         self._context = ContextManager(self.model)
 
         # 记忆召回状态：
-        # _already_surfaced_memories — 本会话已经展示过的记忆路径，避免同一条反复打扰
-        # _session_memory_bytes      — 累计召回字节数，超过 60KB 后停止再召回
+        # _already_surfaced_memories — 本会话已经展示过的记忆路径，防止同一条记忆在本会话里反复注入，造成"唠叨"式重复。
+        # _session_memory_bytes      — 作用：防止整个对话被记忆内容撑爆（单会话累计召回不超过 60KB）。
         self._already_surfaced_memories: set[str] = set()
         self._session_memory_bytes: int = 0
 
@@ -254,6 +254,8 @@ class Agent:
         MCP 工具按 mcp__ 前缀转发到对应服务器。"""
         if name == "agent":
             return await self._execute_agent_tool(inp)
+        if name in ("enter_plan_mode", "exit_plan_mode"):
+            return await self._execute_plan_mode_tool(name)
         if self._mcp_manager.is_mcp_tool(name):
             try:
                 return await self._mcp_manager.call_tool(name, inp)
@@ -468,29 +470,60 @@ class Agent:
     def toggle_plan_mode(self) -> str:
         """切换计划模式（只读），返回当前权限模式"""
         if self.permission_mode == "plan":
-            # 退出计划模式，恢复之前的权限模式
-            self.permission_mode = self._pre_plan_mode or "default"
-            self._permission_checker.set_mode(self.permission_mode)
-            self._permission_checker.set_plan_file(None)
-            self._pre_plan_mode = None
-            self._plan_file_path = None
-            self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
+            self._exit_plan_mode()
             self.ui.print_system(f"已退出计划模式 → {self.permission_mode} 模式")
             return self.permission_mode
         else:
-            # 进入计划模式，保存当前权限模式
-            self._pre_plan_mode = self.permission_mode
-            self.permission_mode = "plan"
-            self._permission_checker.set_mode("plan")
-            self._plan_file_path = self._generate_plan_file_path()
-            self._permission_checker.set_plan_file(self._plan_file_path)
-            self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
+            self._enter_plan_mode()
             self.ui.print_system(f"已进入计划模式。计划文件: {self._plan_file_path}")
             return "plan"
+
+    def _enter_plan_mode(self) -> None:
+        """进入计划模式（只读）：保存当前权限模式，切到 plan，挂上计划文件与附加提示。"""
+        if self.permission_mode == "plan":
+            return
+        self._pre_plan_mode = self.permission_mode
+        self.permission_mode = "plan"
+        self._permission_checker.set_mode("plan")
+        self._plan_file_path = self._generate_plan_file_path()
+        self._permission_checker.set_plan_file(self._plan_file_path)
+        self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
+        if self.use_openai and self._openai_messages:
+            self._openai_messages[0]["content"] = self._system_prompt
+
+    def _exit_plan_mode(self) -> None:
+        """退出计划模式，恢复进入前的权限模式与系统提示。"""
+        self.permission_mode = self._pre_plan_mode or "default"
+        self._permission_checker.set_mode(self.permission_mode)
+        self._permission_checker.set_plan_file(None)
+        self._pre_plan_mode = None
+        self._plan_file_path = None
+        self._system_prompt = self._base_system_prompt
+        if self.use_openai and self._openai_messages:
+            self._openai_messages[0]["content"] = self._system_prompt
+
+    async def _execute_plan_mode_tool(self, name: str) -> str:
+        """执行 enter_plan_mode / exit_plan_mode 工具。需要修改 Agent 实例状态
+        （权限模式、系统提示、计划文件），因此在 agent.py 分发而非走无状态 execute_tool。"""
+        if name == "enter_plan_mode":
+            if self.permission_mode == "plan":
+                return "Already in plan mode."
+            self._enter_plan_mode()
+            self.ui.print_system(f"已进入计划模式。计划文件: {self._plan_file_path}")
+            return (
+                f"Entered plan mode (read-only). Write your plan to {self._plan_file_path} "
+                "using write_file/edit_file, then call exit_plan_mode when done."
+            )
+        # exit_plan_mode
+        if self.permission_mode != "plan":
+            return "Not in plan mode."
+        plan_file = self._plan_file_path
+        self._exit_plan_mode()
+        self.ui.print_system(f"已退出计划模式 → {self.permission_mode} 模式")
+        return (
+            f"Exited plan mode. Plan was written to {plan_file}. "
+            f"Now in {self.permission_mode} mode — you may proceed with implementation."
+        )
 
     def _generate_plan_file_path(self) -> str:
         """生成计划文件路径"""
@@ -543,13 +576,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     async def run(self, user_message: str) -> None:
         self._aborted = False
-        self._turn_count += 1
 
-        # 检查预算和轮次限制
+        # 先检查预算和轮次限制，再自增轮次计数
+        # （若先自增，--max-turns 1 会在第一轮就因 1 >= 1 被拒，用户一轮都跑不了）
         budget = self._check_budget()
         if budget["exceeded"]:
             self.ui.print_system(budget["reason"])
             return
+
+        self._turn_count += 1
 
         # MCP 懒加载：首次对话时连接服务器并把工具暴露给模型。
         # 只在主 Agent 加载；失败只输出日志，不影响内置工具继续工作。
@@ -609,7 +644,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             # 2. 准备预执行字典
             early_executions: dict[str, asyncio.Task] = {}
 
-            # 3. 定义回调：当流式响应收到一个完整的工具调用时，立即预执行安全工具
+            # 3. 定义回调：当流式响应收到一个完整的工具调用时，只有【并发安全工具】才会【立即执行】
             def _on_tool_block(block: dict):
                 if block["name"] in CONCURRENCY_SAFE_TOOLS:
                     perm = self._permission_checker.check(block["name"], block["input"])
@@ -679,9 +714,25 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 self.ui.print_tool_result(res)
                 tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
 
+            # 8b. 回填：为所有未产生 tool_result 的 tool_use 补占位结果。
+            # 否则中途 abort / break 会导致 tool_use 与 tool_result 不配对，
+            # 下次调用报 "tool_use ids were found without tool_result blocks"。
+            responded_ids = {r["tool_use_id"] for r in tool_results}
+            for tu in tool_uses:
+                if tu.id not in responded_ids:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": "(tool call not executed: interrupted)",
+                    })
+
             # 9. 把工具执行结果加入上下文，继续循环（模型会根据结果继续输出）
             if tool_results:
                 self._anthropic_messages.append({"role": "user", "content": tool_results})
+
+            # abort 时回填完配对再退出，避免残缺历史被持久化
+            if self._aborted:
+                break
 
 
     @staticmethod
@@ -778,6 +829,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         # 启动异步记忆预取（每轮一次）。返回 None 时表示不满足触发条件，无需后续轮询。
         memory_prefetch: MemoryPrefetch | None = None
+        # 获取记忆是以当前项目目录构成的sha256路径为基础的，所以同一项目的记忆放在同一个地方。
         sq = self._build_side_query()
         if sq:
             memory_prefetch = start_memory_prefetch(
@@ -887,6 +939,27 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         res = await self._execute_tool_call(ct["fn"], ct["inp"])
                         self.ui.print_tool_result(res)
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
+
+            # 回填：OpenAI 要求每个 tool_call 都有对应的 tool 响应。中途 abort、
+            # 非 function 类型 tool_call（被 continue 跳过）等都会缺响应，
+            # 下一轮 create() 会直接报错。这里为所有未响应的 tool_call 补占位结果。
+            responded_ids = {
+                m.get("tool_call_id")
+                for m in self._openai_messages
+                if m.get("role") == "tool"
+            }
+            for tc in tool_calls:
+                tc_id = tc.get("id")
+                if tc_id and tc_id not in responded_ids:
+                    self._openai_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": "(tool call not executed: interrupted)",
+                    })
+
+            # abort 时回填完配对再退出，避免残缺历史被持久化
+            if self._aborted:
+                break
 
 
     # ─── 危险命令确认 ──────────────────────────────────────

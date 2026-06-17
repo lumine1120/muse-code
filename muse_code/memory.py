@@ -295,7 +295,7 @@ SELECT_MEMORIES_PROMPT = """你正在为 AI 编程助手选择有用的记忆。
 
 async def select_relevant_memories(
     query: str,
-    side_query: SideQueryFn,
+    side_query: SideQueryFn,  # 一个小模型的client，调用时传入用户查询和记忆清单，返回模型的文本响应
     already_surfaced: set[str],
 ) -> list[RelevantMemory]:
     """用 sideQuery 让模型按语义选择最相关的记忆，最多 5 条。

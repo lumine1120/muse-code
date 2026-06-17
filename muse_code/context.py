@@ -194,12 +194,26 @@ def persist_large_result(tool_name: str, result: str) -> str:
 
 
 def budget_trim_text(text: str, budget: int) -> str:
-    """按预算截断文本，保留头尾"""
+    """按预算截断文本，保留头尾。
+
+    当文本超过 budget 字符时，保留开头和结尾各约 (budget-80)//2 个字符，
+    中间替换为截断提示信息（80 字符）。这样模型至少能看到文本的开头和结尾，
+    保留关键的上下文信息（开头通常是命令输出摘要，结尾通常是最新内容）。
+
+    Args:
+        text: 原始文本内容
+        budget: 截断后的目标字符数上限
+
+    Returns:
+        如果原文本未超预算，原样返回；否则返回 "头部 + 截断提示 + 尾部" 的拼接文本
+    """
     if len(text) <= budget:
         return text
+    # 计算首尾各保留的字符数：(总预算 - 截断提示字符) / 2
     keep_each = (budget - 80) // 2
     return (
         text[:keep_each]
+        # 截断提示，告知被裁减了多少字符
         + f"\n\n[... budgeted: {len(text) - keep_each * 2} chars truncated ...]\n\n"
         + text[-keep_each:]
     )
@@ -250,28 +264,42 @@ def apply_budget_anthropic(
 
 
 def _extract_file_path(result_text: str) -> str | None:
-    """尝试从工具结果文本中提取文件路径"""
+    """尝试从工具结果文本中提取文件路径。
+
+    当前为存根实现，始终返回 None。后续可扩展为解析 read_file 结果的
+    首行（如 "File: /path/to/file.go"）来提取精确路径，从而实现更精准的
+    按文件路径去重（同一文件的多次读取视为同一 key）。
+    """
     # read_file 结果的第一行通常是带行号的文件内容
     # 简单策略：看内容的前 100 个字符中是否有明显路径
     lines = result_text.split("\n", 1)
     if not lines:
         return None
-    return None  # 简化实现：不尝试提取路径，用内容哈希做去重
+    return None  # 存根实现：不尝试提取路径，用内容哈希做去重
 
 
 def _make_tool_key(tool_name: str, result_text: str) -> str:
-    """为工具调用生成去重键
-    
-    对于 read_file：尝试用 filename 去重
-    对于 grep_search / list_files：用内容哈希去重
+    """为工具结果生成去重键（dedup key）。
+
+    去重键决定了哪些工具结果被视为"重复"：
+    - read_file：用结果前 500 字符做 SHA256 哈希（前 16 位），
+      意味着读取同一文件（内容前 500 字符相同）的结果共享一个 key。
+      前 500 字符通常包含文件路径声明和文件开头代码，足以区分不同文件。
+    - 其他工具（grep_search / list_files / run_shell）：
+      用完整结果文本的 SHA256 哈希（前 16 位）作为 key，
+      意味着完全相同的输出才被视为重复。
+
+    Returns:
+        格式为 "tool_name:16位哈希" 的去重键，如 "read_file:a1b2c3d4e5f6g7h8"
     """
     # 对 read_file，保留最近几个不同文件的读取
     if tool_name == "read_file":
-        # 用内容前 200 字符做粗略去重
+        # 用内容前 500 字符做粗略去重——足以区分不同文件
         content_hash = hashlib.sha256(
             result_text[:500].encode("utf-8", errors="replace")
         ).hexdigest()[:16]
         return f"read_file:{content_hash}"
+    # 其他工具：只有完全相同的输出才算重复
     return f"{tool_name}:{hashlib.sha256(result_text.encode('utf-8', errors='replace')).hexdigest()[:16]}"
 
 
@@ -279,11 +307,31 @@ def apply_snip_openai(
     messages: list[dict[str, Any]],
     utilization: float,
 ) -> None:
-    """对 OpenAI 格式消息应用 Snip 去重"""
+    """对 OpenAI 格式消息应用 Snip 去重（Layer 2）。
+
+    核心思路：同一去重键的工具结果，只保留最近的 N 个，更早的替换为占位符。
+
+    去重键生成规则（见 _make_tool_key）：
+    - read_file：结果前 500 字符的 SHA256 哈希 → 不同文件自然分到不同 key
+    - 其他工具：完整结果文本的 SHA256 哈希 → 完全相同的输出才算重复
+
+    当前局限：未通过 tool_call_id 反查实际的工具名，
+    所有 tool 消息统一使用 tool_name="unknown" 生成 key。
+    这意味着去重键为 "unknown:{full_content_hash}"，
+    即：任何工具产生两次相同输出也会被去重，不仅限于同类工具之间。
+
+    流程：
+    1. 从后往前遍历消息，收集每个去重键对应的 tool 消息索引列表
+    2. 对每个去重键，只保留最近 SNIP_KEEP_RECENT（默认 3）个
+    3. 将其余更早的 tool 消息 content 替换为 SNIP_PLACEHOLDER
+
+    触发条件：窗口利用率 >= SNIP_UTILIZATION_THRESHOLD（默认 60%）
+    """
     if utilization < SNIP_UTILIZATION_THRESHOLD:
         return
 
     # 收集最近的工具结果（从后往前），同一去重键只保留最近 KEEP_RECENT 个
+    # key 格式: "unknown:{sha256_full_content[:16]}"
     tool_occurrences: dict[str, list[int]] = {}  # key → [index, ...]
 
     for i in range(len(messages) - 1, -1, -1):
@@ -293,18 +341,20 @@ def apply_snip_openai(
         content = msg.get("content", "")
         if not isinstance(content, str):
             continue
-        # 确定用的是哪个工具（从前面最近的 tool_calls 推断）
-        # 简化：tool_call_id 可以帮我们关联
+        # 注意：当前未通过 tool_call_id 反查实际工具名，
+        # 统一用 "unknown" 作为 tool_name
+        # 可通过解析 msg["tool_call_id"] 在前面的 assistant 消息中查找对应工具名来改进
         key = _make_tool_key("unknown", content)
         if key not in tool_occurrences:
             tool_occurrences[key] = []
         tool_occurrences[key].append(i)
 
-    # 对每个去重键，只保留最近 SNIP_KEEP_RECENT 个
+    # 对每个去重键，只保留最近 SNIP_KEEP_RECENT 个（indices 从后往前，越靠前越新）
     for key, indices in tool_occurrences.items():
         if len(indices) <= SNIP_KEEP_RECENT:
             continue
-        # indices 是按从后往前收集的，所以最后面的（更早的）需要被 snip
+        # indices 是按从后往前收集的（index 越大越新），
+        # indices[0] 是最新的，indices[SNIP_KEEP_RECENT:] 是更早的 → 需要 snip
         for idx in indices[SNIP_KEEP_RECENT:]:
             messages[idx]["content"] = SNIP_PLACEHOLDER
 
@@ -313,11 +363,22 @@ def apply_snip_anthropic(
     messages: list[dict[str, Any]],
     utilization: float,
 ) -> None:
-    """对 Anthropic 格式消息应用 Snip 去重"""
+    """对 Anthropic 格式消息应用 Snip 去重（Layer 2）。
+
+    与 OpenAI 版本逻辑相同，但消息结构不同：
+    Anthropic 的 tool_result 嵌套在 user 消息的 content 数组块中，
+    而非独立的 tool 角色消息。
+
+    去重键生成规则同 _make_tool_key（当前使用 tool_name="unknown"）。
+    每个去重键只保留最近 SNIP_KEEP_RECENT（默认 3）个 tool_result 块，
+    更早的替换为 SNIP_PLACEHOLDER。
+
+    触发条件：窗口利用率 >= SNIP_UTILIZATION_THRESHOLD（默认 60%）
+    """
     if utilization < SNIP_UTILIZATION_THRESHOLD:
         return
 
-    # 收集所有 tool_result 块位置
+    # 收集所有 tool_result 块位置：(消息索引, 块索引, 去重键)
     tool_locations: list[tuple[int, int, str]] = []  # (msg_idx, block_idx, key)
 
     for mi, msg in enumerate(messages):
@@ -329,6 +390,7 @@ def apply_snip_anthropic(
         for bi, block in enumerate(content):
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 text = block.get("content", "")
+                # 截取前 200 字符用于 deup key 生成，减少哈希计算开销
                 key = _make_tool_key("tool", str(text)[:200])
                 tool_locations.append((mi, bi, key))
 
@@ -342,7 +404,7 @@ def apply_snip_anthropic(
     for key, locations in grouped.items():
         if len(locations) <= SNIP_KEEP_RECENT:
             continue
-        # locations 是从前往后的，最后 SNIP_KEEP_RECENT 个保留
+        # locations 是从前往后排列的，倒数 SNIP_KEEP_RECENT 个保留（最新），其余 snip
         for mi, bi in locations[:-SNIP_KEEP_RECENT]:
             block = messages[mi]["content"][bi]
             if isinstance(block, dict):
@@ -592,7 +654,7 @@ class ContextManager:
     def __init__(self, model: str):
         self.model = model
         self.counter = TokenCounter()
-        self._compact_failure_count = 0
+        self._compact_failure_count = 0 # 记录连续压缩失败次数
         self._max_compact_failures = 3  # 熔断器
 
     @property
@@ -621,8 +683,11 @@ class ContextManager:
         utilization = self.counter.effective_utilization(self.model)
 
         if use_openai:
+            # Layer 1: 动态缩减工具结果（50%/70% 双阈值）
             apply_budget_openai(messages, utilization)
+            # Layer 2: 替换过时的工具结果（同文件去重，保留最近 3 个）
             apply_snip_openai(messages, utilization)
+            # Layer 2.5: 缓存冷启动激进清理（5 分钟空闲触发）
             apply_microcompact_openai(messages, self.counter.last_api_call_time)
         else:
             apply_budget_anthropic(messages, utilization)

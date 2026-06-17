@@ -127,7 +127,13 @@ def main() -> None:
     # 单次提示词模式 vs 交互模式
     prompt = " ".join(args.prompt) if args.prompt else None
     if prompt:
-        asyncio.run(agent.chat(prompt) if hasattr(agent, 'chat') else agent.run(prompt))
+        async def _run_once() -> None:
+            try:
+                await agent.run(prompt)
+            finally:
+                # 退出前清理 MCP 子进程，避免孤儿进程
+                await agent._mcp_manager.disconnect_all()
+        asyncio.run(_run_once())
     else:
         asyncio.run(run_repl(agent))
 
