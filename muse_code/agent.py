@@ -32,6 +32,13 @@ from .memory import (
 )
 from .subagent import get_sub_agent_config
 from .mcp import McpManager
+from .react import (
+    REACT_SYSTEM_SUFFIX,
+    format_tools_for_react,
+    parse_react_response,
+    format_observation,
+    MAX_REACT_STEPS,
+)
 
 def _is_retryable(error: Exception) -> bool:
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
@@ -82,6 +89,7 @@ class Agent:
         custom_tools: list[dict] | None = None,
         is_sub_agent: bool = False,
         confirm_fn: Callable[[str], Awaitable[bool]] | None = None,
+        reasoning_mode: str = "tool_loop",
     ):
         self.ui = ui
         self.permission_mode = permission_mode
@@ -89,6 +97,8 @@ class Agent:
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self._aborted = False
+        # reasoning_mode: "tool_loop"（默认，依赖模型 function calling）或 "react"（显式 Thought/Action/Observation）
+        self.reasoning_mode = reasoning_mode
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
         self.confirm_fn = confirm_fn  # 外部确认回调
 
@@ -194,7 +204,9 @@ class Agent:
         prev_in = self._total_input_tokens
         prev_out = self._total_output_tokens
         try:
-            if self.use_openai:
+            if self.reasoning_mode == "react":
+                await self._chat_react(prompt)
+            elif self.use_openai:
                 await self._chat_openai(prompt)
             else:
                 await self._chat_anthropic(prompt)
@@ -236,6 +248,7 @@ class Agent:
             api_key=self._api_key,
             api_base=self._api_base,
             anthropic_base_url=self._anthropic_base_url,
+            reasoning_mode=self.reasoning_mode,
         )
 
         try:
@@ -591,7 +604,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         await self._ensure_mcp_loaded()
 
         try:
-            if self.use_openai:
+            if self.reasoning_mode == "react":
+                await self._chat_react(user_message)
+            elif self.use_openai:
                 await self._chat_openai(user_message)
             else:
                 await self._chat_anthropic(user_message)
@@ -1087,3 +1102,222 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             }
 
         return await _with_retry(_do)
+
+    # ─── ReAct mode ───────────────────────────────────────────
+
+    def _build_react_system_prompt(self) -> str:
+        """构建 ReAct 模式的系统提示：基础 prompt + ReAct 指令 + 工具描述。"""
+        if self._custom_tools is not None:
+            tools = get_active_tool_definitions(self._custom_tools)
+        else:
+            tools = get_active_tool_definitions() + self._mcp_tool_defs
+        tool_desc = format_tools_for_react(tools)
+        return self._base_system_prompt + REACT_SYSTEM_SUFFIX.format(
+            tool_descriptions=tool_desc
+        )
+
+    async def _call_react_openai_stream(self) -> tuple[str, dict]:
+        """ReAct 模式下的 OpenAI 流式调用（不传 tools 参数，纯文本补全）。"""
+        async def _do():
+            stream = await self._openai_client.chat.completions.create(
+                model=self.model,
+                messages=self._openai_messages,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            content = ""
+            first_text = True
+            usage: dict = {}
+            async for chunk in stream:
+                if not chunk.choices:
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        usage = {
+                            "input_tokens": getattr(chunk.usage, "prompt_tokens", 0)
+                            or getattr(chunk.usage, "input_tokens", 0),
+                            "output_tokens": getattr(chunk.usage, "completion_tokens", 0)
+                            or getattr(chunk.usage, "output_tokens", 0),
+                        }
+                    continue
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    if first_text:
+                        if self._output_buffer is None:
+                            self.ui.console.print("\n[bold purple]Muse Code[/bold purple]")
+                        first_text = False
+                    self._emit_text(delta.content)
+                    content += delta.content
+            if not first_text and self._output_buffer is None:
+                self.ui.console.print()
+            return content, usage
+        return await _with_retry(_do)
+
+    async def _call_react_anthropic_stream(self) -> tuple[str, dict]:
+        """ReAct 模式下的 Anthropic 流式调用（不传 tools 参数，纯文本补全）。"""
+        async def _do():
+            content = ""
+            first_text = True
+            usage: dict = {}
+            async with self._anthropic_client.messages.stream(
+                model=self.model,
+                max_tokens=4096,
+                system=self._system_prompt,
+                messages=self._anthropic_messages,
+            ) as stream:
+                async for event in stream:
+                    if not hasattr(event, "type"):
+                        continue
+                    if event.type == "content_block_delta":
+                        delta = event.delta
+                        if hasattr(delta, "text"):
+                            if first_text:
+                                if self._output_buffer is None:
+                                    self.ui.console.print("\n[bold purple]Muse Code[/bold purple]")
+                                first_text = False
+                            self._emit_text(delta.text)
+                            content += delta.text
+                final_msg = await stream.get_final_message()
+                if hasattr(final_msg, "usage"):
+                    usage = {
+                        "input_tokens": getattr(final_msg.usage, "input_tokens", 0),
+                        "output_tokens": getattr(final_msg.usage, "output_tokens", 0),
+                    }
+            if not first_text and self._output_buffer is None:
+                self.ui.console.print()
+            return content, usage
+        return await _with_retry(_do)
+
+    async def _chat_react(self, user_message: str) -> None:
+        """ReAct 模式主循环：Thought → Action → Observation → ... → Final Answer。
+
+        与 tool-loop 的核心区别：
+        - 不使用 function calling API，模型输出纯文本
+        - 模型先显式推理（Thought），再决定调用什么工具（Action）
+        - 工具结果以 Observation 形式注入，而非 tool role 消息
+        - 适合推理能力较弱的模型，通过结构化思考步骤弥补
+        """
+        # 构建 ReAct 系统提示（含工具描述）
+        react_system = self._build_react_system_prompt()
+        if self.use_openai:
+            self._openai_messages[0]["content"] = react_system
+        else:
+            self._system_prompt = react_system
+
+        # Layer 3: 轮次边界检查 auto-compact
+        if self._context.should_auto_compact():
+            self.ui.print_system("上下文窗口即将填满，正在压缩对话...")
+            if self.use_openai:
+                self._openai_messages = await self._context.do_compact_openai(
+                    self._openai_messages, self._openai_client
+                )
+            else:
+                self._anthropic_messages = await self._context.do_compact_anthropic(
+                    self._anthropic_messages, self._anthropic_client, self._system_prompt
+                )
+
+        # 用户消息加入上下文
+        if self.use_openai:
+            self._openai_messages.append({"role": "user", "content": user_message})
+        else:
+            self._anthropic_messages.append({"role": "user", "content": user_message})
+
+        # 异步记忆预取（与 tool-loop 共用逻辑）
+        memory_prefetch: MemoryPrefetch | None = None
+        sq = self._build_side_query()
+        if sq:
+            memory_prefetch = start_memory_prefetch(
+                user_message, sq,
+                self._already_surfaced_memories, self._session_memory_bytes,
+            )
+
+        # ReAct 循环
+        for step in range(MAX_REACT_STEPS):
+            if self._aborted:
+                break
+
+            # 非阻塞消费记忆预取
+            if self.use_openai:
+                self._consume_memory_prefetch_openai(memory_prefetch)
+            else:
+                self._consume_memory_prefetch_anthropic(memory_prefetch)
+
+            # Layer 1+2: Budget + Snip pipeline
+            if self.use_openai:
+                self._context.run_pre_call_pipeline(self._openai_messages, use_openai=True)
+            else:
+                self._context.run_pre_call_pipeline(self._anthropic_messages, use_openai=False)
+
+            # 调用 LLM（纯文本，不传 tools）
+            if self.use_openai:
+                text, usage = await self._call_react_openai_stream()
+            else:
+                text, usage = await self._call_react_anthropic_stream()
+
+            # 记录 token
+            if usage:
+                self._record_tokens(
+                    usage.get("input_tokens", 0),
+                    usage.get("output_tokens", 0),
+                )
+
+            # 模型响应加入上下文
+            if self.use_openai:
+                self._openai_messages.append({"role": "assistant", "content": text})
+            else:
+                self._anthropic_messages.append({"role": "assistant", "content": text})
+
+            # 解析 ReAct 响应
+            parsed = parse_react_response(text)
+
+            if parsed["type"] == "final":
+                # 任务完成
+                break
+
+            if parsed["type"] == "action":
+                tool_name = parsed["tool"]
+                tool_input = parsed["input"]
+
+                self.ui.print_tool_call(tool_name, json.dumps(tool_input))
+
+                # 权限检查（与 tool-loop 共用逻辑）
+                perm = self._permission_checker.check(tool_name, tool_input)
+                if perm.action == "deny":
+                    self.ui.print_error(f"Denied: {perm.message}")
+                    observation = f"Action denied: {perm.message}"
+                elif perm.action == "confirm":
+                    whitelist_id = perm.whitelist_identifier or perm.message
+                    if whitelist_id not in self._confirmed_paths:
+                        confirmed = await self._confirm_dangerous(tool_name, perm)
+                        if not confirmed:
+                            self._permission_checker.deny()
+                            observation = f"User denied: {perm.message}"
+                        else:
+                            self._confirmed_paths.add(whitelist_id)
+                            self._permission_checker.confirm(tool_name, whitelist_id)
+                            result = await self._execute_tool_call(tool_name, tool_input)
+                            self.ui.print_tool_result(result)
+                            observation = result
+                    else:
+                        result = await self._execute_tool_call(tool_name, tool_input)
+                        self.ui.print_tool_result(result)
+                        observation = result
+                else:
+                    result = await self._execute_tool_call(tool_name, tool_input)
+                    self.ui.print_tool_result(result)
+                    observation = result
+
+                # Observation 作为 user 消息注入（ReAct 的核心交互格式）
+                obs_text = format_observation(observation)
+                if self.use_openai:
+                    self._openai_messages.append({"role": "user", "content": obs_text})
+                else:
+                    self._anthropic_messages.append({"role": "user", "content": obs_text})
+            else:
+                # 解析失败：要求模型修正格式
+                error_msg = parsed["message"]
+                if self.use_openai:
+                    self._openai_messages.append({"role": "user", "content": error_msg})
+                else:
+                    self._anthropic_messages.append({"role": "user", "content": error_msg})
+        else:
+            # for...else：循环正常结束（未 break），说明达到最大步数
+            self.ui.print_system(f"达到 ReAct 最大步数 ({MAX_REACT_STEPS})，停止执行。")

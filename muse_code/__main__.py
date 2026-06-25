@@ -22,6 +22,8 @@ def parse_args() -> argparse.Namespace:
                         help="尽量不向用户提问")
     parser.add_argument("--thinking", action="store_true",
                         help="启用扩展思考模式")
+    parser.add_argument("--react", action="store_true",
+                        help="启用 ReAct 模式（显式 Thought/Action/Observation，适合推理能力较弱的模型）")
     parser.add_argument("--model", "-m", default=None,
                         help="指定模型名称")
     parser.add_argument("--api-base", default=None,
@@ -65,6 +67,7 @@ def main() -> None:
             "  --accept-edits     自动接受文件编辑\n"
             "  --dont-ask         尽量不向用户提问\n"
             "  --thinking         启用扩展思考模式\n"
+            "  --react            ReAct 模式（显式推理，适合弱模型）\n"
             "  --model, -m MODEL  指定模型名称\n"
             "  --api-base URL     自定义 API 基地址\n"
             "  --resume           恢复上一次会话\n"
@@ -111,6 +114,7 @@ def main() -> None:
         api_key=resolved_api_key,
         api_base=args.api_base if resolved_use_openai else None,
         anthropic_base_url=args.api_base if not resolved_use_openai else None,
+        reasoning_mode="react" if args.react else "tool_loop",
     )
 
     # 恢复会话
