@@ -2232,3 +2232,157 @@ muse "帮我读一下 README.md"
 # ReAct 模式
 muse --react "帮我读一下 README.md 并总结"
 ```
+
+
+## （13）feat：子 Agent 超时转后台异步执行，完成后 XML 通知注入父 Agent
+
+**提交:** `待提交` | **修改 2 个文件，共 +90 行**
+
+> **一句话概括：** 父 Agent 调用子 Agent 时同步等待超时阈值（默认 30s），超时后子 Agent 转后台运行不取消，父 Agent 继续工作；后台子 Agent 完成后结果格式化为 XML 通知，伪装成 user 消息注入父 Agent 对话历史，下轮 API 调用时模型自然看到。
+
+### 设计背景
+
+原有 fork-return 模式下，`_execute_agent_tool` 用 `await sub_agent.run_once(prompt)` 完全阻塞父 Agent。子 Agent 跑慢任务（大范围代码搜索、多步重构）时父 Agent 只能干等，用户也看不到任何进展。
+
+### 整体流程
+
+```
+父 Agent 调用 agent 工具
+  │
+  ├─ asyncio.wait_for(sub_agent.run_once(), timeout=30s)
+  │
+  ├─ < 30s 完成 → 正常返回结果字符串
+  │
+  └─ > 30s 超时 → 注册到 _background_tasks，不取消 Task
+       │
+       ├─ tool_result 返回 "已转后台，稍后通知你"（保证 tool_call/tool_result 配对）
+       │
+       ├─ 父 Agent 继续 while True 主循环
+       │   每轮 API 调用前：
+       │   _consume_background_tasks()
+       │     ├─ task.done()? No → 跳过
+       │     └─ task.done()? Yes → 格式化 XML → 注入 user 消息
+       │
+       └─ 父 Agent 下次 API 调用时模型看到：
+           <task-notification>
+             <task-id>agent-001</task-id>
+             <status>completed</status>
+             <summary>Sub-agent 'xxx' completed</summary>
+             <result>...</result>
+             <usage>...</usage>
+           </task-notification>
+```
+
+### 各模块详解
+
+**[muse_code/agent.py](file:///Users/lumine/code/llm/muse-code/muse_code/agent.py) — 3 处改动**
+
+| 变更 | 说明 |
+|------|------|
+| `__init__` 新增 `_background_tasks` 注册表 | `dict[str, dict]`，存放转后台的子 Agent Task + 元信息（agent_type/description/start_time） |
+| `__init__` 新增 `sub_agent_timeout` | 默认 30.0s，可通过 CLI `--sub-agent-timeout` 覆盖 |
+| 重写 `_execute_agent_tool` | `asyncio.create_task` + `asyncio.wait_for` 带超时等待；超时后注册到 `_background_tasks`，返回提示字符串 |
+| 新增 `_format_task_notification` | 把后台子 Agent 结果格式化为 XML（含 task-id/status/summary/result/usage/duration） |
+| 新增 `_consume_background_tasks` | 非阻塞检查所有后台任务 `.done()`，完成的格式化 XML 注入为 user 消息，Token 汇总到父 Agent |
+| 主循环接入 | `_chat_openai` / `_chat_anthropic` 的 while True 里，记忆预取消费之后、API 调用之前调用 `_consume_background_tasks()` |
+
+**[muse_code/__main__.py](file:///Users/lumine/code/llm/muse-code/muse_code/__main__.py) — CLI 参数**
+
+| 变更 | 说明 |
+|------|------|
+| 新增 `--sub-agent-timeout` | 浮点数，默认 30.0，控制子 Agent 同步等待超时 |
+| `agent.sub_agent_timeout = args.sub_agent_timeout` | 启动时注入配置 |
+
+### 关键设计决策
+
+1. **超时不取消 Task**：`asyncio.wait_for` 超时后抛 `TimeoutError`，但底层 Task 仍在 event loop 里跑。转后台注册后继续执行，不浪费已完成的计算。
+
+2. **XML 伪装为 user 消息**：而不是注入 system 消息或 tool role。原因是 OpenAI/Anthropic 的 API 要求 user/assistant 交替，tool role 只能紧跟在 tool_call 后。XML 通知是异步到达的，时序上更接近"用户发来的新信息"。
+
+3. **与记忆预取共用消费模式**：`_consume_background_tasks` 的设计跟 `_consume_memory_prefetch` 完全一致——非阻塞、每轮检查、一次注入、已消费的删除。复用了成熟的异步消费范式。
+
+4. **tool_result 保证配对**：超时后返回提示字符串 `"Sub-agent moved to background (task-id: agent-001)..."` 作为 tool_result，确保 tool_call/tool_result 不缺配（否则下轮 API 报错）。
+
+### 使用方式
+
+```bash
+# 默认 30s 超时
+muse "帮我重构 auth 模块"
+
+# 自定义 10s 超时
+muse --sub-agent-timeout 10 "帮我搜索所有 TODO"
+```
+
+
+## （14）feat：上下文压缩对齐 Claude Code — 9 部分结构化摘要 + 文件恢复 + Context Collapse 读时投影
+
+**提交:** `待提交` | **修改 2 个文件，共 +200 行**
+
+> **一句话概括：** 参考 Claude Code 的上下文管理设计，将 Auto-Compact 从一段式摘要升级为 9 部分结构化摘要 + 压缩后文件恢复；新增 Layer 4 Context Collapse 读时投影，压缩管道不再破坏原始消息，只在 API 调用时返回深拷贝压缩副本。
+
+### 设计背景
+
+原有 Auto-Compact 只生成一段话摘要（`"Summarize the conversation so far in a concise paragraph..."`），丢失了用户消息枚举、当前工作进度、文件路径等关键信息。压缩后模型"失忆"严重，需要重新读取已知文件。此外 Budget Trim / Snip 直接修改原始消息（in-place），被砍掉的内容永远找不回来。
+
+### Phase 2：9 部分结构化摘要 + 文件恢复
+
+**摘要 prompt 升级**：从一句话改为 9 部分结构化 XML 输出（参考 Claude Code）：
+1. Primary Request and Intent
+2. Key Technical Concepts
+3. Files and Code Sections
+4. Errors and fixes
+5. Problem Solving
+6. **All user messages**（枚举每条，不概括）
+7. Pending Tasks
+8. **Current Work**（精确到文件名/函数名）
+9. Optional Next Step
+
+**文件恢复**：压缩后按最近活跃度恢复最多 5 个文件（每个 ≤5K chars，总额 ≤50K），从 `_read_file_state` 的 mtime 排序选取。消息重组结构变为：`[system] → [9 部分摘要] → [assistant 接续] → [恢复文件附件] → [assistant 接续] → [最新 user 消息]`。
+
+### Phase 3：Context Collapse 读时投影
+
+**核心改变**：`run_pre_call_pipeline` 从"直接修改原始消息"改为"返回压缩副本"。
+
+| 利用率 | 行为 |
+|---|---|
+| < 50% | 零拷贝，直接返回原始消息 |
+| 50%-90% | 深拷贝 → Budget → Snip → Microcompact，返回副本 |
+| >= 90% | 深拷贝 → Budget → Snip → Microcompact → Context Collapse（更激进：8K 预算、保留 2 个），返回副本 |
+
+**只有 Auto-Compact（>= 85% effective）才是破坏性操作**——它会替换整个消息历史。Context Collapse 是非破坏性的，原始消息永远不被 Budget/Snip/Microcompact 修改。
+
+### 各模块详解
+
+**[muse_code/context.py](file:///Users/lumine/code/llm/muse-code/muse_code/context.py)**
+
+| 变更 | 说明 |
+|---|---|
+| `COMPACT_SYSTEM_PROMPT` 升级 | 从一句话改为 9 部分结构化 XML 输出指令 |
+| 新增 `restore_recent_files()` | 按最近活跃度恢复文件，3 个常量：`MAX_FILES=5`、`MAX_CHARS_PER_FILE=5000`、`MAX_TOTAL_CHARS=50000` |
+| `compact_openai/anthropic()` 加 `read_file_state` 参数 | 压缩后调用 `restore_recent_files` 恢复文件 |
+| `max_tokens` 从 2048 提升到 4096 | 9 部分摘要需要更大输出空间 |
+| 新增 `COLLAPSE_UTILIZATION_THRESHOLD=0.90` | Context Collapse 触发阈值 |
+| 新增 `apply_context_collapse_openai/anthropic()` | 在深拷贝副本上应用更激进的 Budget（8K）+ Snip（保留 2 个） |
+| `run_pre_call_pipeline()` 改返回值 | 从 `None` 改为 `list[dict]`，低利用率零拷贝，高利用率深拷贝+压缩返回副本 |
+
+**[muse_code/agent.py](file:///Users/lumine/code/llm/muse-code/muse_code/agent.py)**
+
+| 变更 | 说明 |
+|---|---|
+| 4 个 API 调用方法加 `messages_override` 参数 | `_call_anthropic_stream` / `_call_openai_stream` / `_call_react_openai_stream` / `_call_react_anthropic_stream` |
+| 3 处主循环用返回值调 API | `api_messages = run_pre_call_pipeline(...)` → `await _call_xxx_stream(messages_override=api_messages)` |
+| 4 处 `do_compact` 调用传入 `self._read_file_state` | 让 compact 函数能拿到最近读过的文件列表做恢复 |
+
+### 对齐 Claude Code 的程度
+
+| Claude Code 特性 | 状态 |
+|---|---|
+| 9 部分结构化摘要 | ✅ |
+| 文件恢复（最多 5 个、5K/个、50K 总额） | ✅ |
+| All user messages 枚举 | ✅ |
+| Current Work 精确到文件/函数 | ✅ |
+| 信息分通道（语义进摘要、状态走附件） | ✅ |
+| Context Collapse 读时投影 | ✅ |
+| 不破坏原始消息 | ✅ |
+| 摘要用同一模型复用 prompt cache | ✅ |
+| Kairos transcript 备份 | ❌ |

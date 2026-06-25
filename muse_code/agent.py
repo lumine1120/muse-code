@@ -578,7 +578,7 @@ class Agent:
                 return
             prev_len = len(self._openai_messages)
             self._openai_messages = await self._context.do_compact_openai(
-                self._openai_messages, self._openai_client
+                self._openai_messages, self._openai_client, self._read_file_state
             )
             after_len = len(self._openai_messages)
         else:
@@ -587,7 +587,7 @@ class Agent:
                 return
             prev_len = len(self._anthropic_messages)
             self._anthropic_messages = await self._context.do_compact_anthropic(
-                self._anthropic_messages, self._anthropic_client, self._system_prompt
+                self._anthropic_messages, self._anthropic_client, self._system_prompt, self._read_file_state
             )
             after_len = len(self._anthropic_messages)
         
@@ -744,7 +744,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if self._context.should_auto_compact():
             self.ui.print_system("上下文窗口即将填满，正在压缩对话...")
             self._anthropic_messages = await self._context.do_compact_anthropic(
-                self._anthropic_messages, self._anthropic_client, self._system_prompt
+                self._anthropic_messages, self._anthropic_client, self._system_prompt, self._read_file_state
             )
 
         # 1. 把用户消息加入上下文
@@ -769,8 +769,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             # 非阻塞消费后台子 Agent：完成则注入 XML 通知
             self._consume_background_tasks()
 
-            # Layer 1+2: Budget + Snip pipeline before each API call
-            self._context.run_pre_call_pipeline(self._anthropic_messages, use_openai=False)
+            # Layer 1+2+4: Budget + Snip + Context Collapse pipeline（返回压缩副本，不破坏原始）
+            api_messages = self._context.run_pre_call_pipeline(self._anthropic_messages, use_openai=False)
 
             # 2. 准备预执行字典
             early_executions: dict[str, asyncio.Task] = {}
@@ -783,8 +783,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         task = asyncio.create_task(execute_tool(block["name"], block["input"], self._read_file_state))
                         early_executions[block["id"]] = task
 
-            # 4. 调用流式 API！
-            response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            # 4. 调用流式 API！（用压缩副本）
+            response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block, messages_override=api_messages)
 
             # 记录 token 使用量
             if hasattr(response, "usage"):
@@ -874,7 +874,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             return {"type": "tool_use", "id": block.id, "name": block.name, "input": dict(block.input) if hasattr(block.input, 'items') else block.input}
         return {"type": block.type}
 
-    async def _call_anthropic_stream(self, on_tool_block_complete=None):
+    async def _call_anthropic_stream(self, on_tool_block_complete=None, messages_override=None):
         async def _do():
             # 子 Agent 用构造时注入的受限工具集；主 Agent 用全量激活工具（含 agent）。
             if self._custom_tools is not None:
@@ -888,7 +888,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 "max_tokens": 4096,
                 "system": self._system_prompt,
                 "tools": filtered_tools,
-                "messages": self._anthropic_messages,
+                "messages": messages_override or self._anthropic_messages,
             }
 
             first_text = True
@@ -952,7 +952,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if self._context.should_auto_compact():
             self.ui.print_system("上下文窗口即将填满，正在压缩对话...")
             self._openai_messages = await self._context.do_compact_openai(
-                self._openai_messages, self._openai_client
+                self._openai_messages, self._openai_client, self._read_file_state
             )
 
         # 1. 用户消息加入上下文
@@ -978,11 +978,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             # 非阻塞消费后台子 Agent：完成则注入 XML 通知
             self._consume_background_tasks()
 
-            # Layer 1+2: Budget + Snip pipeline before each API call
-            self._context.run_pre_call_pipeline(self._openai_messages, use_openai=True)
+            # Layer 1+2+4: Budget + Snip + Context Collapse pipeline
+            api_messages = self._context.run_pre_call_pipeline(self._openai_messages, use_openai=True)
 
-            # 2. 调用流式 API
-            response = await self._call_openai_stream()
+            # 2. 调用流式 API（用压缩副本）
+            response = await self._call_openai_stream(messages_override=api_messages)
 
             # 记录 token 使用量
             usage = response.get("usage")
@@ -1134,7 +1134,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         except (EOFError, KeyboardInterrupt):
             return False
 
-    async def _call_openai_stream(self) -> dict:
+    async def _call_openai_stream(self, messages_override=None) -> dict:
         async def _do():
             # 子 Agent 用构造时注入的受限工具集；主 Agent 用全量激活工具（含 agent）。
             if self._custom_tools is not None:
@@ -1147,7 +1147,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,
                 tools=_to_openai_tools(filtered_tools),
-                messages=self._openai_messages,
+                messages=messages_override or self._openai_messages,
                 stream=True,  # 关键！开启流式
                 stream_options={"include_usage": True},  # 让最后 chunk 包含 usage
             )
@@ -1235,12 +1235,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             tool_descriptions=tool_desc
         )
 
-    async def _call_react_openai_stream(self) -> tuple[str, dict]:
+    async def _call_react_openai_stream(self, messages_override=None) -> tuple[str, dict]:
         """ReAct 模式下的 OpenAI 流式调用（不传 tools 参数，纯文本补全）。"""
         async def _do():
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,
-                messages=self._openai_messages,
+                messages=messages_override or self._openai_messages,
                 stream=True,
                 stream_options={"include_usage": True},
             )
@@ -1270,7 +1270,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             return content, usage
         return await _with_retry(_do)
 
-    async def _call_react_anthropic_stream(self) -> tuple[str, dict]:
+    async def _call_react_anthropic_stream(self, messages_override=None) -> tuple[str, dict]:
         """ReAct 模式下的 Anthropic 流式调用（不传 tools 参数，纯文本补全）。"""
         async def _do():
             content = ""
@@ -1280,7 +1280,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 model=self.model,
                 max_tokens=4096,
                 system=self._system_prompt,
-                messages=self._anthropic_messages,
+                messages=messages_override or self._anthropic_messages,
             ) as stream:
                 async for event in stream:
                     if not hasattr(event, "type"):
@@ -1326,11 +1326,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self.ui.print_system("上下文窗口即将填满，正在压缩对话...")
             if self.use_openai:
                 self._openai_messages = await self._context.do_compact_openai(
-                    self._openai_messages, self._openai_client
+                    self._openai_messages, self._openai_client, self._read_file_state
                 )
             else:
                 self._anthropic_messages = await self._context.do_compact_anthropic(
-                    self._anthropic_messages, self._anthropic_client, self._system_prompt
+                    self._anthropic_messages, self._anthropic_client, self._system_prompt, self._read_file_state
                 )
 
         # 用户消息加入上下文
@@ -1359,17 +1359,17 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             else:
                 self._consume_memory_prefetch_anthropic(memory_prefetch)
 
-            # Layer 1+2: Budget + Snip pipeline
+            # Layer 1+2+4: Budget + Snip + Context Collapse pipeline
             if self.use_openai:
-                self._context.run_pre_call_pipeline(self._openai_messages, use_openai=True)
+                api_messages = self._context.run_pre_call_pipeline(self._openai_messages, use_openai=True)
             else:
-                self._context.run_pre_call_pipeline(self._anthropic_messages, use_openai=False)
+                api_messages = self._context.run_pre_call_pipeline(self._anthropic_messages, use_openai=False)
 
-            # 调用 LLM（纯文本，不传 tools）
+            # 调用 LLM（纯文本，不传 tools，用压缩副本）
             if self.use_openai:
-                text, usage = await self._call_react_openai_stream()
+                text, usage = await self._call_react_openai_stream(messages_override=api_messages)
             else:
-                text, usage = await self._call_react_anthropic_stream()
+                text, usage = await self._call_react_anthropic_stream(messages_override=api_messages)
 
             # 记录 token
             if usage:

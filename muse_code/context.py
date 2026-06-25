@@ -49,6 +49,13 @@ MICROCOMPACT_CLEARED = "[Old result cleared]"
 COMPACT_UTILIZATION_THRESHOLD = 0.85
 COMPACT_RESERVED_TOKENS = 20000  # 预留给新一轮输入/输出
 
+# ─── Context Collapse 配置（Layer 4 读时投影）─────────
+# 参考 Claude Code：不修改原始消息，只在 API 调用时深拷贝 + 压缩副本。
+# 触发条件：利用率 >= 90%（比 Budget Trim 的 50% 阈值更激进）
+COLLAPSE_UTILIZATION_THRESHOLD = 0.90
+COLLAPSE_BUDGET_CHARS = 8000  # Collapse 模式下的单工具结果预算（比 BUDGET_CHARS_2 的 15K 更激进）
+COLLAPSE_KEEP_RECENT = 2     # Collapse 保留最近 2 个同文件结果（比 SNIP_KEEP_RECENT 的 3 更少）
+
 # ─── 上下文窗口（按模型）────────────────────────────
 DEFAULT_CONTEXT_WINDOW = 128_000
 CONTEXT_WINDOWS: dict[str, int] = {
@@ -485,14 +492,31 @@ def apply_microcompact_anthropic(
 # Layer 3: Auto-compact — 全量摘要压缩
 # ═══════════════════════════════════════════════════════════════
 
-COMPACT_SYSTEM_PROMPT = (
-    "You are a conversation summarizer. "
-    "Be concise but preserve important details."
-)
+COMPACT_SYSTEM_PROMPT = """You are a conversation summarizer. You MUST NOT call any tools — only return text.
+
+Output your summary in this exact XML structure:
+
+<analysis>
+(Brief reasoning about what to include — this section will be discarded)
+</analysis>
+<summary>
+1. Primary Request and Intent: What the user asked for
+2. Key Technical Concepts: Technologies, patterns, and architecture involved
+3. Files and Code Sections: File paths read or modified, with key code snippets
+4. Errors and fixes: Errors encountered and how they were resolved
+5. Problem Solving: Decisions made and approaches tried
+6. All user messages: Enumerate EVERY user message in order, one per line — do not summarize, list each one
+7. Pending Tasks: What remains to be done
+8. Current Work: Be specific — exact file names, function names, and current progress
+9. Optional Next Step: What should be done next
+</summary>
+
+CRITICAL: Do NOT call any tools. Do NOT ask questions. Only return the summary text."""
 
 COMPACT_USER_PROMPT = (
-    "Summarize the conversation so far in a concise paragraph, "
-    "preserving key decisions, file paths, and context needed to continue the work."
+    "Summarize the conversation so far using the 9-part structure above. "
+    "Enumerate ALL user messages (item 6) — do not paraphrase, list each one. "
+    "For Current Work (item 8), be specific about exact file paths and function names."
 )
 
 COMPACT_ASSISTANT_RESPONSE = (
@@ -500,16 +524,186 @@ COMPACT_ASSISTANT_RESPONSE = (
     "How can I continue helping?"
 )
 
+# ─── 压缩后文件恢复配置 ─────────────────────────────────
+# 参考 Claude Code：压缩后按最近活跃度恢复关键文件，
+# 让 Agent 接续工作时不用重新读取已知文件。
+POST_COMPACT_MAX_FILES = 5           # 最多恢复 5 个文件
+POST_COMPACT_MAX_CHARS_PER_FILE = 5000  # 每个文件最多 ~5K token（≈20K chars 粗估取 5K）
+POST_COMPACT_MAX_TOTAL_CHARS = 50000    # 总额不超过 ~50K token
+
+
+def restore_recent_files(
+    read_file_state: dict[str, float],
+    max_files: int = POST_COMPACT_MAX_FILES,
+    max_chars_per_file: int = POST_COMPACT_MAX_CHARS_PER_FILE,
+    max_total_chars: int = POST_COMPACT_MAX_TOTAL_CHARS,
+) -> str:
+    """压缩后恢复最近活跃的文件内容。
+
+    从 _read_file_state（{abs_path: mtime}）中按 mtime 降序取最近 N 个文件，
+    读取内容并截断，返回一段格式化的"已恢复文件"文本。
+    如果读取失败或无文件，返回空字符串。
+    """
+    if not read_file_state:
+        return ""
+
+    # 按 mtime 降序排序（最近修改的优先）
+    sorted_paths = sorted(
+        read_file_state.items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    parts: list[str] = []
+    total_chars = 0
+
+    for abs_path, _mtime in sorted_paths[:max_files]:
+        try:
+            from pathlib import Path
+            p = Path(abs_path)
+            if not p.is_file():
+                continue
+            content = p.read_text(errors="replace")
+            if not content:
+                continue
+
+            # 截断单个文件
+            if len(content) > max_chars_per_file:
+                content = content[:max_chars_per_file] + "\n... (truncated)"
+
+            entry = f"--- {abs_path} ---\n{content}"
+            entry_len = len(entry)
+
+            # 检查总额
+            if total_chars + entry_len > max_total_chars:
+                remaining = max_total_chars - total_chars
+                if remaining < 200:
+                    break
+                entry = entry[:remaining] + "\n... (budget reached)"
+                entry_len = len(entry)
+
+            parts.append(entry)
+            total_chars += entry_len
+
+            if total_chars >= max_total_chars:
+                break
+        except Exception:
+            continue
+
+    if not parts:
+        return ""
+
+    return "[Recently read files restored after compact]\n\n" + "\n\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Layer 4: Context Collapse — 读时投影，不破坏原始消息
+# ═══════════════════════════════════════════════════════════════
+
+
+def apply_context_collapse_openai(
+    messages: list[dict[str, Any]],
+    utilization: float,
+) -> None:
+    """对 OpenAI 格式消息副本应用更激进的压缩（Context Collapse 模式）。
+
+    与 Budget Trim/Snip 的区别：本函数在**已深拷贝的副本**上操作，
+    原始消息不受影响。触发条件是利用率 >= 90%。
+
+    激进策略：
+    - 工具结果预算降到 COLLAPSE_BUDGET_CHARS（8K，比 BUDGET_CHARS_2 的 15K 更小）
+    - 同文件去重保留最近 COLLAPSE_KEEP_RECENT 个（2 个，比 Snip 的 3 个更少）
+    """
+    # 更激进的 budget trim
+    for msg in messages:
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str) and len(content) > COLLAPSE_BUDGET_CHARS:
+            msg["content"] = budget_trim_text(content, COLLAPSE_BUDGET_CHARS)
+
+    # 更激进的 snip：只保留最近 COLLAPSE_KEEP_RECENT 个
+    tool_occurrences: dict[str, list[int]] = {}
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            continue
+        if content in (SNIP_PLACEHOLDER, MICROCOMPACT_CLEARED):
+            continue
+        key = _make_tool_key("unknown", content)
+        if key not in tool_occurrences:
+            tool_occurrences[key] = []
+        tool_occurrences[key].append(i)
+
+    for key, indices in tool_occurrences.items():
+        if len(indices) <= COLLAPSE_KEEP_RECENT:
+            continue
+        for idx in indices[COLLAPSE_KEEP_RECENT:]:
+            messages[idx]["content"] = SNIP_PLACEHOLDER
+
+
+def apply_context_collapse_anthropic(
+    messages: list[dict[str, Any]],
+    utilization: float,
+) -> None:
+    """对 Anthropic 格式消息副本应用更激进的压缩（Context Collapse 模式）。"""
+    # 更激进的 budget trim
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                text = block.get("content", "")
+                if isinstance(text, str) and len(text) > COLLAPSE_BUDGET_CHARS:
+                    block["content"] = budget_trim_text(text, COLLAPSE_BUDGET_CHARS)
+
+    # 更激进的 snip
+    tool_locations: list[tuple[int, int, str]] = []
+    for mi, msg in enumerate(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for bi, block in enumerate(content):
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                text = block.get("content", "")
+                if text in (SNIP_PLACEHOLDER, MICROCOMPACT_CLEARED):
+                    continue
+                key = _make_tool_key("tool", str(text)[:200])
+                tool_locations.append((mi, bi, key))
+
+    grouped: dict[str, list[tuple[int, int]]] = {}
+    for mi, bi, key in tool_locations:
+        if key not in grouped:
+            grouped[key] = []
+        grouped[key].append((mi, bi))
+
+    for key, locations in grouped.items():
+        if len(locations) <= COLLAPSE_KEEP_RECENT:
+            continue
+        for mi, bi in locations[:-COLLAPSE_KEEP_RECENT]:
+            block = messages[mi]["content"][bi]
+            if isinstance(block, dict):
+                block["content"] = SNIP_PLACEHOLDER
+
 
 async def compact_openai(
     messages: list[dict[str, Any]],
     client: Any,
     model: str,
+    read_file_state: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """压缩 OpenAI 格式对话历史。
     
-    保留 system message，用 LLM 生成摘要替换历史。
-    返回新的消息列表。
+    保留 system message，用 LLM 生成 9 部分结构化摘要替换历史，
+    压缩后按最近活跃度恢复关键文件。返回新的消息列表。
     """
     if len(messages) < 5:
         return messages
@@ -521,7 +715,7 @@ async def compact_openai(
     try:
         summary_resp = await client.chat.completions.create(
             model=model,
-            max_tokens=2048,
+            max_tokens=4096,  # 9 部分结构化摘要需要更大空间
             messages=[
                 {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
                 *messages[1:-1],
@@ -543,6 +737,13 @@ async def compact_openai(
         {"role": "assistant", "content": COMPACT_ASSISTANT_RESPONSE},
     ]
 
+    # 文件恢复：压缩后按最近活跃度恢复关键文件
+    if read_file_state:
+        restored = restore_recent_files(read_file_state)
+        if restored:
+            new_messages.append({"role": "user", "content": restored})
+            new_messages.append({"role": "assistant", "content": "Understood. I have the restored file context. Continuing..."})
+
     # 只把最后一条 user 消息追回（不追 tool 消息）
     if last_msg.get("role") == "user":
         new_messages.append(last_msg)
@@ -555,10 +756,11 @@ async def compact_anthropic(
     client: Any,
     model: str,
     system_prompt: str,
+    read_file_state: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """压缩 Anthropic 格式对话历史。
     
-    生成摘要替换历史，保留 system prompt。
+    生成 9 部分结构化摘要替换历史，压缩后恢复关键文件。
     """
     if len(messages) < 4:
         return messages
@@ -569,7 +771,7 @@ async def compact_anthropic(
     try:
         summary_resp = await client.messages.create(
             model=model,
-            max_tokens=2048,
+            max_tokens=4096,
             system=COMPACT_SYSTEM_PROMPT,
             messages=[
                 *messages[:-1],
@@ -589,6 +791,13 @@ async def compact_anthropic(
         {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
         {"role": "assistant", "content": COMPACT_ASSISTANT_RESPONSE},
     ]
+
+    # 文件恢复
+    if read_file_state:
+        restored = restore_recent_files(read_file_state)
+        if restored:
+            new_messages.append({"role": "user", "content": restored})
+            new_messages.append({"role": "assistant", "content": "Understood. I have the restored file context. Continuing..."})
 
     # 只把最后一条 user 消息追回
     if last_msg.get("role") == "user":
@@ -672,27 +881,47 @@ class ContextManager:
         """持久化超大工具结果（Layer 0.5）"""
         return persist_large_result(tool_name, result)
 
-    # ─── Layer 1+2+2.5 (pre-call pipeline) ─────────
+    # ─── Layer 1+2+2.5+4 (pre-call pipeline) ─────────
 
     def run_pre_call_pipeline(
         self,
         messages: list[dict[str, Any]],
         use_openai: bool,
-    ) -> None:
-        """每次 API 调用前执行 Budget → Snip → Microcompact 管道"""
+    ) -> list[dict[str, Any]]:
+        """每次 API 调用前执行压缩管道，返回应传给 API 的消息列表。
+
+        Context Collapse 设计（参考 Claude Code L4）：
+        - 低利用率（<50%）：零拷贝，直接返回原始 messages
+        - 中利用率（50%-90%）：深拷贝 → Budget → Snip → Microcompact，返回副本
+        - 高利用率（>=90%）：深拷贝 → Budget → Snip → Microcompact → Context Collapse，返回副本
+
+        原始 messages 永不被修改，只有 Auto-Compact（Layer 3）才是破坏性操作。
+        """
         utilization = self.counter.effective_utilization(self.model)
 
+        # 低利用率：不需要压缩，直接返回原始消息（零拷贝）
+        if utilization < BUDGET_THRESHOLD_1:
+            return messages
+
+        # Context Collapse：深拷贝后在副本上压缩，不破坏原始消息
+        import copy
+        collapsed = copy.deepcopy(messages)
+
         if use_openai:
-            # Layer 1: 动态缩减工具结果（50%/70% 双阈值）
-            apply_budget_openai(messages, utilization)
-            # Layer 2: 替换过时的工具结果（同文件去重，保留最近 3 个）
-            apply_snip_openai(messages, utilization)
-            # Layer 2.5: 缓存冷启动激进清理（5 分钟空闲触发）
-            apply_microcompact_openai(messages, self.counter.last_api_call_time)
+            apply_budget_openai(collapsed, utilization)
+            apply_snip_openai(collapsed, utilization)
+            apply_microcompact_openai(collapsed, self.counter.last_api_call_time)
+            # Layer 4: 高利用率时应用更激进的压缩
+            if utilization >= COLLAPSE_UTILIZATION_THRESHOLD:
+                apply_context_collapse_openai(collapsed, utilization)
         else:
-            apply_budget_anthropic(messages, utilization)
-            apply_snip_anthropic(messages, utilization)
-            apply_microcompact_anthropic(messages, self.counter.last_api_call_time)
+            apply_budget_anthropic(collapsed, utilization)
+            apply_snip_anthropic(collapsed, utilization)
+            apply_microcompact_anthropic(collapsed, self.counter.last_api_call_time)
+            if utilization >= COLLAPSE_UTILIZATION_THRESHOLD:
+                apply_context_collapse_anthropic(collapsed, utilization)
+
+        return collapsed
 
     # ─── Layer 3 (turn boundary) ──────────────────
 
@@ -706,10 +935,11 @@ class ContextManager:
         self,
         messages: list[dict[str, Any]],
         client: Any,
+        read_file_state: dict[str, float] | None = None,
     ) -> list[dict[str, Any]]:
-        """执行 OpenAI 后端的全量压缩"""
+        """执行 OpenAI 后端的全量压缩（含文件恢复）"""
         try:
-            result = await compact_openai(messages, client, self.model)
+            result = await compact_openai(messages, client, self.model, read_file_state)
             self.counter.last_input_tokens = 0
             self._compact_failure_count = 0
             return result
@@ -722,10 +952,11 @@ class ContextManager:
         messages: list[dict[str, Any]],
         client: Any,
         system_prompt: str,
+        read_file_state: dict[str, float] | None = None,
     ) -> list[dict[str, Any]]:
-        """执行 Anthropic 后端的全量压缩"""
+        """执行 Anthropic 后端的全量压缩（含文件恢复）"""
         try:
-            result = await compact_anthropic(messages, client, self.model, system_prompt)
+            result = await compact_anthropic(messages, client, self.model, system_prompt, read_file_state)
             self.counter.last_input_tokens = 0
             self._compact_failure_count = 0
             return result
