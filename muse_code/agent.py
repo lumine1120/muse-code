@@ -177,6 +177,15 @@ class Agent:
         self._mcp_initialized = False
         self._mcp_tool_defs: list[dict] = []
 
+        # ─── 后台子 Agent 注册表 ──────────────────────
+        # 当子 Agent 执行超过 sub_agent_timeout 秒时，转后台运行。
+        # 主循环每轮 API 调用前非阻塞检查：已完成的后台任务结果被格式化为
+        # XML 通知，伪装成 user 消息注入对话历史。
+        self._background_tasks: dict[str, dict] = {}
+        # {task_id: {"task": asyncio.Task, "agent_type": str, "description": str, "start_time": float}}
+        self.sub_agent_timeout: float = 30.0  # 默认 30s，可通过 CLI --sub-agent-timeout 覆盖
+        self._bg_task_counter: int = 0
+
     def abort(self) -> None:
         self._aborted = True
 
@@ -226,6 +235,9 @@ class Agent:
 
         子 Agent 拥有独立的消息历史（天然上下文隔离），出错时返回错误字符串
         而非抛出，让父 Agent 的 LLM 自行决定重试或换策略。
+
+        超时机制：如果子 Agent 在 sub_agent_timeout 秒内未完成，转为后台运行。
+        主循环会在后续轮次中检测完成并注入 XML 通知。
         """
         agent_type = inp.get("type") or "general"
         description = inp.get("description", "sub-agent task")
@@ -251,12 +263,33 @@ class Agent:
             reasoning_mode=self.reasoning_mode,
         )
 
+        # 创建后台 Task
+        task = asyncio.create_task(sub_agent.run_once(prompt))
+
         try:
-            result = await sub_agent.run_once(prompt)
-            # token 汇总到父 Agent（子 Agent 自身不打印费用，避免重复计费的错觉）
+            # 带超时等待
+            result = await asyncio.wait_for(task, timeout=self.sub_agent_timeout)
+            # token 汇总到父 Agent
             self._record_tokens(result["tokens"]["input"], result["tokens"]["output"])
             self.ui.print_sub_agent_end(agent_type)
             return result["text"] or "(Sub-agent produced no output)"
+        except asyncio.TimeoutError:
+            # 超时：转后台，不取消 task
+            self._bg_task_counter += 1
+            task_id = f"agent-{self._bg_task_counter:03d}"
+            self._background_tasks[task_id] = {
+                "task": task,
+                "sub_agent": sub_agent,
+                "agent_type": agent_type,
+                "description": description,
+                "start_time": time.time(),
+            }
+            self.ui.print_sub_agent_end(agent_type)
+            return (
+                f"Sub-agent '{description}' is taking longer than {self.sub_agent_timeout}s. "
+                f"It has been moved to background (task-id: {task_id}). "
+                f"You will be notified when it completes. Continue with other work."
+            )
         except Exception as e:
             self.ui.print_sub_agent_end(agent_type)
             return f"Sub-agent error: {e}"
@@ -448,6 +481,86 @@ class Agent:
         for m in memories:
             self._already_surfaced_memories.add(m.path)
             self._session_memory_bytes += len(m.content.encode())
+
+    # ─── 后台子 Agent 完成检测 ─────────────────────────────
+
+    @staticmethod
+    def _format_task_notification(task_id: str, entry: dict, result: dict) -> str:
+        """把后台子 Agent 的完成结果格式化为 XML 通知。
+
+        伪装成一条 user 消息注入对话历史，让父 Agent 的 LLM 自然看到。
+        """
+        duration_s = time.time() - entry["start_time"]
+        tokens = result.get("tokens", {})
+        text = result.get("text", "")
+
+        return (
+            f"<task-notification>\n"
+            f"  <task-id>{task_id}</task-id>\n"
+            f"  <status>completed</status>\n"
+            f"  <summary>Sub-agent '{entry['description']}' ({entry['agent_type']}) completed</summary>\n"
+            f"  <result>{text or '(no output)'}</result>\n"
+            f"  <usage>\n"
+            f"    <total_tokens>{tokens.get('input', 0) + tokens.get('output', 0)}</total_tokens>\n"
+            f"    <duration_ms>{int(duration_s * 1000)}</duration_ms>\n"
+            f"  </usage>\n"
+            f"</task-notification>"
+        )
+
+    def _consume_background_tasks(self) -> None:
+        """非阻塞检查后台子 Agent 是否完成，完成的注入 XML 通知。
+
+        在主循环 while True 的每轮 API 调用前调用。
+        与 _consume_memory_prefetch 模式一致：非阻塞、一次注入、已消费的删除。
+        """
+        if not self._background_tasks:
+            return
+
+        completed_ids: list[str] = []
+        notifications: list[str] = []
+
+        for task_id, entry in self._background_tasks.items():
+            task = entry["task"]
+            if not task.done():
+                continue
+
+            completed_ids.append(task_id)
+            try:
+                result = task.result()
+                # token 汇总到父 Agent
+                tokens = result.get("tokens", {})
+                self._record_tokens(tokens.get("input", 0), tokens.get("output", 0))
+
+                notification = self._format_task_notification(task_id, entry, result)
+                notifications.append(notification)
+
+                self.ui.print_sub_agent_end(entry["agent_type"])
+            except Exception as e:
+                # 后台任务异常：也通知父 Agent，但标记为 failed
+                notifications.append(
+                    f"<task-notification>\n"
+                    f"  <task-id>{task_id}</task-id>\n"
+                    f"  <status>failed</status>\n"
+                    f"  <summary>Sub-agent '{entry['description']}' failed</summary>\n"
+                    f"  <result>{e}</result>\n"
+                    f"</task-notification>"
+                )
+                self.ui.print_sub_agent_end(entry["agent_type"])
+
+        if not notifications:
+            return
+
+        # 合并所有完成通知为一条 user 消息
+        combined = "\n\n".join(notifications)
+
+        if self.use_openai:
+            self._openai_messages.append({"role": "user", "content": combined})
+        else:
+            self._anthropic_messages.append({"role": "user", "content": combined})
+
+        # 清理已完成的任务
+        for tid in completed_ids:
+            del self._background_tasks[tid]
 
     def _check_budget(self) -> dict:
         """检查是否超出预算或轮次限制"""
@@ -652,6 +765,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             # 非阻塞消费记忆预取：完成则注入，未完成则下一轮再检查
             self._consume_memory_prefetch_anthropic(memory_prefetch)
+
+            # 非阻塞消费后台子 Agent：完成则注入 XML 通知
+            self._consume_background_tasks()
 
             # Layer 1+2: Budget + Snip pipeline before each API call
             self._context.run_pre_call_pipeline(self._anthropic_messages, use_openai=False)
@@ -858,6 +974,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             # 非阻塞消费记忆预取：完成则注入，未完成则下一轮再检查
             self._consume_memory_prefetch_openai(memory_prefetch)
+
+            # 非阻塞消费后台子 Agent：完成则注入 XML 通知
+            self._consume_background_tasks()
 
             # Layer 1+2: Budget + Snip pipeline before each API call
             self._context.run_pre_call_pipeline(self._openai_messages, use_openai=True)

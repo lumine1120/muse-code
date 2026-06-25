@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
                         help="最大费用限制（USD）")
     parser.add_argument("--max-turns", type=int, default=None,
                         help="最大对话轮次")
+    parser.add_argument("--sub-agent-timeout", type=float, default=30.0,
+                        help="子 Agent 同步等待超时秒数，超时后转后台运行（默认 30）")
     parser.add_argument("--help", "-h", action="store_true",
                         help="显示帮助信息")
     return parser.parse_args()
@@ -73,6 +75,7 @@ def main() -> None:
             "  --resume           恢复上一次会话\n"
             "  --max-cost USD     最大费用限制\n"
             "  --max-turns N      最大对话轮次\n"
+            "  --sub-agent-timeout SECONDS  子Agent超时转后台（默认30）\n"
             "  --help, -h         显示帮助信息\n"
         )
         sys.exit(0)
@@ -116,6 +119,7 @@ def main() -> None:
         anthropic_base_url=args.api_base if not resolved_use_openai else None,
         reasoning_mode="react" if args.react else "tool_loop",
     )
+    agent.sub_agent_timeout = args.sub_agent_timeout
 
     # 恢复会话
     if args.resume:
