@@ -93,8 +93,10 @@ def parse_react_response(text: str) -> dict[str, Any]:
         answer = final_match.group(1).strip()
         return {"type": "final", "answer": answer}
 
-    # 提取 Action 和 Action Input
-    action_match = re.search(r"Action\s*:?\s*(\S+)", text)
+    # 提取 Action 和 Action Input。
+    # 注意：Action 的正则用负向先行断言排除 "Action Input"，否则会把
+    # "Action Input" 里的 "Input" 误当成工具名（弱模型漏写 Action 行时常见）。
+    action_match = re.search(r"Action\s*:?\s*(?!Input\b)([A-Za-z_][\w-]*)", text)
     input_match = re.search(
         r"Action\s*Input\s*:?\s*(\{.*?\})", text, re.DOTALL
     )

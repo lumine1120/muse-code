@@ -1,18 +1,17 @@
-"""上下文管理模块 — 6 层分级压缩管道
+"""上下文管理模块 — 5 层压缩金字塔（对齐 Claude Code）
 
-防止对话历史超出 LLM 上下文窗口：
-  Layer 0:   truncate_result — >50K chars 硬截断，保留头尾（在 tools.py）
-  Layer 0.5: persist_large_result — >30KB 工具结果写入磁盘，保留 200 行预览
-  Layer 1:   budget_trim — 动态缩减工具结果（50%/70% 双阈值）
-  Layer 2:   snip — 替换过时的工具结果（同文件去重，保留最近 3 个）
-  Layer 2.5: microcompact — 缓存冷启动激进清理（5 分钟空闲触发）
-  Layer 3:   auto_compact — 全量摘要压缩（85% 窗口利用率触发）
+从轻到重，能不压就不压，必须压时从最轻手段开始：
+  Layer 1: 大结果存磁盘 — 工具结果 > 50KB 写磁盘，只留预览
+  Layer 2: Snip — 利用率 > 60% 时清空过时 tool_result content，保留 tool_use 元数据
+  Layer 3: Micro-Compact — 60min 未活动时清空可重新获取的工具结果
+  Layer 4: Context Collapse — 利用率 >= 90% 时深拷贝 + 激进压缩，不破坏原始消息
+  Layer 5: Auto-Compact — 距窗口上限 ~33K 时全量重写，9 部分结构化摘要 + 文件恢复
 
 触发时机:
-  - 工具执行后 → Layer 0 + Layer 0.5（执行即触发）
-  - API 调用前  → Layer 1 + Layer 2 + Layer 2.5（零 API 成本）
-  - 轮次边界   → Layer 3 (auto_compact)
-  - 手动 /compact → 强制 Layer 3
+  - 工具执行后 → Layer 1（执行即触发）
+  - API 调用前  → Layer 2 + Layer 3 + Layer 4（零 API 成本，返回压缩副本）
+  - 轮次边界   → Layer 5 (auto_compact)
+  - 手动 /compact → 强制 Layer 5
 
 Token 统计: 用 API 返回的 usage 锚点 + 4 chars ≈ 1 token 粗估
 """
@@ -24,37 +23,35 @@ import time
 from pathlib import Path
 from typing import Any
 
-# ─── 持久化配置 ────────────────────────────────────
-PERSIST_THRESHOLD_BYTES = 30 * 1024  # 30 KB
+# ─── Layer 1: 大结果存磁盘配置 ──────────────────────
+PERSIST_THRESHOLD_BYTES = 50 * 1024  # 50 KB（对齐 Claude Code）
 PERSIST_PREVIEW_LINES = 200
 PERSIST_DIR = Path.home() / ".muse" / "tool-results"
 
-# ─── Budget 配置 ───────────────────────────────────
-BUDGET_THRESHOLD_1 = 0.50  # 50% 窗口利用率 → 30K 预算
-BUDGET_THRESHOLD_2 = 0.70  # 70% 窗口利用率 → 15K 预算
-BUDGET_CHARS_1 = 30000
-BUDGET_CHARS_2 = 15000
-
-# ─── Snip 配置 ─────────────────────────────────────
-SNIP_UTILIZATION_THRESHOLD = 0.60
-SNIP_KEEP_RECENT = 3
+# ─── Layer 2: Snip 配置 ─────────────────────────────
+SNIP_UTILIZATION_THRESHOLD = 0.60   # 利用率 > 60% 触发
+SNIP_KEEP_RECENT = 1                # 同文件只保留最近 1 个（对齐 Claude Code）
 SNIPPABLE_TOOLS = {"read_file", "grep_search", "list_files", "run_shell"}
 SNIP_PLACEHOLDER = "[Content snipped - re-read if needed]"
 
-# ─── Microcompact 配置 ─────────────────────────────
-MICROCOMPACT_IDLE_S = 5 * 60  # 5 分钟空闲触发
+# ─── Layer 3: Micro-Compact 配置 ─────────────────────
+MICROCOMPACT_IDLE_S = 60 * 60       # 60 分钟未活动触发（对齐 Claude Code）
+MICROCOMPACT_KEEP_RECENT = 5        # 保留最近 5 个工具结果
 MICROCOMPACT_CLEARED = "[Old result cleared]"
+# 不可清空的工具结果（子Agent输出、Task状态等"不可重新获取"的信息）
+MICROCOMPACT_PROTECTED_TOOLS = {"agent"}  # agent 工具的输出是子Agent的结果，不可重新获取
 
-# ─── Auto-compact 配置 ─────────────────────────────
-COMPACT_UTILIZATION_THRESHOLD = 0.85
-COMPACT_RESERVED_TOKENS = 20000  # 预留给新一轮输入/输出
+# ─── Layer 5: Auto-Compact 配置 ─────────────────────
+# 参考 Claude Code：不依赖百分比，用绝对缓冲
+AUTOCOMPACT_SUMMARY_TOKENS = 20_000  # 预留给摘要输出（p99.99 = 17.3K 向上取整）
+AUTOCOMPACT_SAFETY_BUFFER = 13_000   # 第二层安全缓冲，让压缩提前触发
+AUTOCOMPACT_TOTAL_BUFFER = AUTOCOMPACT_SUMMARY_TOKENS + AUTOCOMPACT_SAFETY_BUFFER  # ~33K
+COMPACT_RESERVED_TOKENS = AUTOCOMPACT_TOTAL_BUFFER  # 向后兼容
 
-# ─── Context Collapse 配置（Layer 4 读时投影）─────────
-# 参考 Claude Code：不修改原始消息，只在 API 调用时深拷贝 + 压缩副本。
-# 触发条件：利用率 >= 90%（比 Budget Trim 的 50% 阈值更激进）
-COLLAPSE_UTILIZATION_THRESHOLD = 0.90
-COLLAPSE_BUDGET_CHARS = 8000  # Collapse 模式下的单工具结果预算（比 BUDGET_CHARS_2 的 15K 更激进）
-COLLAPSE_KEEP_RECENT = 2     # Collapse 保留最近 2 个同文件结果（比 SNIP_KEEP_RECENT 的 3 更少）
+# ─── Layer 4: Context Collapse 配置 ──────────────────
+COLLAPSE_UTILIZATION_THRESHOLD = 0.90  # 90% 触发读时投影
+COLLAPSE_BUDGET_CHARS = 8000            # Collapse 模式下单工具结果预算
+COLLAPSE_KEEP_RECENT = 2               # Collapse 保留最近 2 个同文件结果
 
 # ─── 上下文窗口（按模型）────────────────────────────
 DEFAULT_CONTEXT_WINDOW = 128_000
@@ -158,12 +155,12 @@ class TokenCounter:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Layer 0.5: 大结果持久化
+# Layer 1: 大结果存磁盘
 # ═══════════════════════════════════════════════════════════════
 
 
 def persist_large_result(tool_name: str, result: str) -> str:
-    """超过 30KB 的工具结果写入磁盘，返回预览。
+    """超过 50KB 的工具结果写入磁盘，返回预览。
     
     在上下文保留 200 行预览 + 持久化文件路径，
     模型后续可用 read_file 读取完整内容。
@@ -196,7 +193,8 @@ def persist_large_result(tool_name: str, result: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Layer 1: Budget — 动态缩减工具结果
+# budget_trim_text — 工具函数，供 Context Collapse 使用
+# （原 Budget Trim 层已移除，对齐 Claude Code 5 层架构）
 # ═══════════════════════════════════════════════════════════════
 
 
@@ -226,47 +224,8 @@ def budget_trim_text(text: str, budget: int) -> str:
     )
 
 
-def apply_budget_openai(
-    messages: list[dict[str, Any]],
-    utilization: float,
-) -> None:
-    """对 OpenAI 格式消息应用 Budget 截断"""
-    if utilization < BUDGET_THRESHOLD_1:
-        return
-    budget = BUDGET_CHARS_2 if utilization > BUDGET_THRESHOLD_2 else BUDGET_CHARS_1
-
-    for msg in messages:
-        if msg.get("role") != "tool":
-            continue
-        content = msg.get("content", "")
-        if isinstance(content, str) and len(content) > budget:
-            msg["content"] = budget_trim_text(content, budget)
-
-
-def apply_budget_anthropic(
-    messages: list[dict[str, Any]],
-    utilization: float,
-) -> None:
-    """对 Anthropic 格式消息应用 Budget 截断"""
-    if utilization < BUDGET_THRESHOLD_1:
-        return
-    budget = BUDGET_CHARS_2 if utilization > BUDGET_THRESHOLD_2 else BUDGET_CHARS_1
-
-    for msg in messages:
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_result":
-                text = block.get("content", "")
-                if isinstance(text, str) and len(text) > budget:
-                    block["content"] = budget_trim_text(text, budget)
-
-
 # ═══════════════════════════════════════════════════════════════
-# Layer 2: Snip — 替换过时的工具结果
+# Layer 2: Snip — 清空过时的 tool_result content，保留 tool_use 元数据
 # ═══════════════════════════════════════════════════════════════
 
 
@@ -419,7 +378,7 @@ def apply_snip_anthropic(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Layer 2.5: Microcompact — 缓存冷启动时激进清理
+# Layer 3: Micro-Compact — 时间衰减，清空可重新获取的工具结果
 # ═══════════════════════════════════════════════════════════════
 
 
@@ -427,18 +386,19 @@ def apply_microcompact_openai(
     messages: list[dict[str, Any]],
     last_api_call_time: float | None,
 ) -> None:
-    """对 OpenAI 格式消息应用 Microcompact。
-    
-    当空闲超过 5 分钟时，prompt cache 大概率已过期，
-    此时激进清理旧工具结果没有缓存失效成本。
-    除最近 3 个外，所有 tool 消息替换为 "[Old result cleared]"。
+    """对 OpenAI 格式消息应用 Micro-Compact。
+
+    当空闲超过 60 分钟时，prompt cache 大概率已过期，
+    此时清空可重新获取的工具结果（Read/Bash/Grep 等）没有缓存失效成本。
+    保留最近 MICROCOMPACT_KEEP_RECENT（5）个。
+    不可清空：子Agent输出（agent 工具结果）、含 task-notification 的消息。
     """
     if not last_api_call_time:
         return
     if (time.time() - last_api_call_time) < MICROCOMPACT_IDLE_S:
         return
 
-    # 收集所有未被 snip/清理过的 tool 消息索引
+    # 收集所有可清空的 tool 消息索引（排除已 snip/cleared 和受保护的）
     tool_indices: list[int] = []
     for i, msg in enumerate(messages):
         if msg.get("role") != "tool":
@@ -448,10 +408,13 @@ def apply_microcompact_openai(
             continue
         if content in (SNIP_PLACEHOLDER, MICROCOMPACT_CLEARED):
             continue
+        # 保护子Agent输出和Task状态通知
+        if "<task-notification>" in content:
+            continue
         tool_indices.append(i)
 
-    # 只保留最近 KEEP_RECENT 个，其余全清
-    clear_count = len(tool_indices) - SNIP_KEEP_RECENT
+    # 只保留最近 MICROCOMPACT_KEEP_RECENT 个，其余全清
+    clear_count = len(tool_indices) - MICROCOMPACT_KEEP_RECENT
     for idx in tool_indices[:max(0, clear_count)]:
         messages[idx]["content"] = MICROCOMPACT_CLEARED
 
@@ -460,13 +423,13 @@ def apply_microcompact_anthropic(
     messages: list[dict[str, Any]],
     last_api_call_time: float | None,
 ) -> None:
-    """对 Anthropic 格式消息应用 Microcompact。"""
+    """对 Anthropic 格式消息应用 Micro-Compact。"""
     if not last_api_call_time:
         return
     if (time.time() - last_api_call_time) < MICROCOMPACT_IDLE_S:
         return
 
-    # 收集所有未被 snip/清理过的 tool_result 块位置
+    # 收集所有可清空的 tool_result 块位置（排除受保护的）
     tool_locations: list[tuple[int, int]] = []
     for mi, msg in enumerate(messages):
         if msg.get("role") != "user":
@@ -477,11 +440,15 @@ def apply_microcompact_anthropic(
         for bi, block in enumerate(content):
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 text = block.get("content", "")
-                if text not in (SNIP_PLACEHOLDER, MICROCOMPACT_CLEARED):
-                    tool_locations.append((mi, bi))
+                if text in (SNIP_PLACEHOLDER, MICROCOMPACT_CLEARED):
+                    continue
+                # 保护子Agent输出和Task状态通知
+                if "<task-notification>" in str(text):
+                    continue
+                tool_locations.append((mi, bi))
 
-    # 只保留最近 KEEP_RECENT 个
-    clear_count = len(tool_locations) - SNIP_KEEP_RECENT
+    # 只保留最近 MICROCOMPACT_KEEP_RECENT 个
+    clear_count = len(tool_locations) - MICROCOMPACT_KEEP_RECENT
     for mi, bi in tool_locations[:max(0, clear_count)]:
         block = messages[mi]["content"][bi]
         if isinstance(block, dict):
@@ -489,7 +456,7 @@ def apply_microcompact_anthropic(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Layer 3: Auto-compact — 全量摘要压缩
+# Layer 5: Auto-Compact — 全量重写 + 9 部分结构化摘要 + 文件恢复
 # ═══════════════════════════════════════════════════════════════
 
 COMPACT_SYSTEM_PROMPT = """You are a conversation summarizer. You MUST NOT call any tools — only return text.
@@ -607,12 +574,12 @@ def apply_context_collapse_openai(
 ) -> None:
     """对 OpenAI 格式消息副本应用更激进的压缩（Context Collapse 模式）。
 
-    与 Budget Trim/Snip 的区别：本函数在**已深拷贝的副本**上操作，
+    与 Snip/Microcompact 的区别：本函数在**已深拷贝的副本**上操作，
     原始消息不受影响。触发条件是利用率 >= 90%。
 
     激进策略：
-    - 工具结果预算降到 COLLAPSE_BUDGET_CHARS（8K，比 BUDGET_CHARS_2 的 15K 更小）
-    - 同文件去重保留最近 COLLAPSE_KEEP_RECENT 个（2 个，比 Snip 的 3 个更少）
+    - 工具结果预算降到 COLLAPSE_BUDGET_CHARS（8K）
+    - 同文件去重保留最近 COLLAPSE_KEEP_RECENT 个（2 个，比 Snip 的 1 个多保留 1 个做缓冲）
     """
     # 更激进的 budget trim
     for msg in messages:
@@ -700,16 +667,29 @@ async def compact_openai(
     model: str,
     read_file_state: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
-    """压缩 OpenAI 格式对话历史。
-    
-    保留 system message，用 LLM 生成 9 部分结构化摘要替换历史，
-    压缩后按最近活跃度恢复关键文件。返回新的消息列表。
+    """压缩 OpenAI 格式对话历史（Layer 5: Auto-Compact）。
+
+    参考 Claude Code：
+    1. Microcompact 预处理：先清空大体积工具结果，减轻摘要器负担
+    2. 全量送进 LLM 生成 9 部分结构化摘要
+    3. buildPostCompactMessages 重组：[边界标记] + [摘要] + [附件（恢复文件）] + [最后一条 user 消息]
     """
     if len(messages) < 5:
         return messages
 
     system_msg = messages[0]  # 保留 system prompt
     last_msg = messages[-1]   # 可能是最新的 user 消息
+
+    # 记录压缩前状态（边界标记）
+    pre_compact_token_est = sum(len(str(m.get("content", ""))) // 4 for m in messages)
+    boundary_marker = (
+        f"[Context compacted. Pre-compact estimated tokens: ~{pre_compact_token_est}. "
+        f"This conversation was continued from a previous one that ran out of context.]"
+    )
+
+    # Microcompact 预处理：清空大体积工具结果，减轻摘要器负担
+    summary_input = [m.copy() for m in messages[1:-1]]  # 不含 system 和最后一条
+    apply_microcompact_openai(summary_input, last_api_call_time=time.time() - MICROCOMPACT_IDLE_S - 1)
 
     # 生成摘要
     try:
@@ -718,7 +698,7 @@ async def compact_openai(
             max_tokens=4096,  # 9 部分结构化摘要需要更大空间
             messages=[
                 {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
-                *messages[1:-1],
+                *summary_input,
                 {"role": "user", "content": COMPACT_USER_PROMPT},
             ],
         )
@@ -730,21 +710,24 @@ async def compact_openai(
         # 摘要生成失败，使用简单截断作为后备
         return _simple_truncate_openai(messages)
 
-    # 重建消息数组
+    # buildPostCompactMessages 重组
     new_messages: list[dict[str, Any]] = [
         system_msg,
-        {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
-        {"role": "assistant", "content": COMPACT_ASSISTANT_RESPONSE},
+        # 边界标记
+        {"role": "user", "content": boundary_marker},
+        # 摘要消息
+        {"role": "assistant", "content": f"[Previous conversation summary]\n{summary_text}"},
+        {"role": "user", "content": COMPACT_ASSISTANT_RESPONSE},
     ]
 
-    # 文件恢复：压缩后按最近活跃度恢复关键文件
+    # 附件：文件恢复（压缩后按最近活跃度恢复关键文件）
     if read_file_state:
         restored = restore_recent_files(read_file_state)
         if restored:
-            new_messages.append({"role": "user", "content": restored})
-            new_messages.append({"role": "assistant", "content": "Understood. I have the restored file context. Continuing..."})
+            new_messages.append({"role": "assistant", "content": restored})
+            new_messages.append({"role": "user", "content": "Understood. I have the restored file context. Continuing..."})
 
-    # 只把最后一条 user 消息追回（不追 tool 消息）
+    # 最后一条 user 消息
     if last_msg.get("role") == "user":
         new_messages.append(last_msg)
 
@@ -758,14 +741,28 @@ async def compact_anthropic(
     system_prompt: str,
     read_file_state: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
-    """压缩 Anthropic 格式对话历史。
-    
-    生成 9 部分结构化摘要替换历史，压缩后恢复关键文件。
+    """压缩 Anthropic 格式对话历史（Layer 5: Auto-Compact）。
+
+    参考 Claude Code：
+    1. Microcompact 预处理：先清空大体积工具结果，减轻摘要器负担
+    2. 全量送进 LLM 生成 9 部分结构化摘要
+    3. buildPostCompactMessages 重组：[边界标记] + [摘要] + [附件（恢复文件）] + [最后一条 user 消息]
     """
     if len(messages) < 4:
         return messages
 
     last_msg = messages[-1]
+
+    # 记录压缩前状态（边界标记）
+    pre_compact_token_est = sum(len(str(m.get("content", ""))) // 4 for m in messages)
+    boundary_marker = (
+        f"[Context compacted. Pre-compact estimated tokens: ~{pre_compact_token_est}. "
+        f"This conversation was continued from a previous one that ran out of context.]"
+    )
+
+    # Microcompact 预处理
+    summary_input = [m.copy() for m in messages[:-1]]
+    apply_microcompact_anthropic(summary_input, last_api_call_time=time.time() - MICROCOMPACT_IDLE_S - 1)
 
     # 生成摘要
     try:
@@ -774,7 +771,7 @@ async def compact_anthropic(
             max_tokens=4096,
             system=COMPACT_SYSTEM_PROMPT,
             messages=[
-                *messages[:-1],
+                *summary_input,
                 {"role": "user", "content": COMPACT_USER_PROMPT},
             ],
         )
@@ -786,20 +783,23 @@ async def compact_anthropic(
     except Exception:
         return _simple_truncate_anthropic(messages)
 
-    # 重建消息数组
+    # buildPostCompactMessages 重组
     new_messages: list[dict[str, Any]] = [
-        {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
-        {"role": "assistant", "content": COMPACT_ASSISTANT_RESPONSE},
+        # 边界标记
+        {"role": "user", "content": boundary_marker},
+        # 摘要消息
+        {"role": "assistant", "content": f"[Previous conversation summary]\n{summary_text}"},
+        {"role": "user", "content": COMPACT_ASSISTANT_RESPONSE},
     ]
 
-    # 文件恢复
+    # 附件：文件恢复
     if read_file_state:
         restored = restore_recent_files(read_file_state)
         if restored:
-            new_messages.append({"role": "user", "content": restored})
-            new_messages.append({"role": "assistant", "content": "Understood. I have the restored file context. Continuing..."})
+            new_messages.append({"role": "assistant", "content": restored})
+            new_messages.append({"role": "user", "content": "Understood. I have the restored file context. Continuing..."})
 
-    # 只把最后一条 user 消息追回
+    # 最后一条 user 消息
     if last_msg.get("role") == "user":
         new_messages.append(last_msg)
 
@@ -841,21 +841,21 @@ def _simple_truncate_anthropic(messages: list[dict[str, Any]]) -> list[dict[str,
 
 
 class ContextManager:
-    """统一上下文管理器，封装 4 层压缩管道 + Token 统计。
+    """统一上下文管理器，封装 5 层压缩金字塔 + Token 统计。
 
     用法:
         ctx = ContextManager("GLM-4.7-Flash")
-        
-        # 每次 API 调用前执行管道
-        ctx.run_pre_call_pipeline(messages, use_openai=True)
-        
-        # 工具执行后持久化大结果
+
+        # 每次 API 调用前执行管道（Layer 2+3+4，返回压缩副本）
+        api_messages = ctx.run_pre_call_pipeline(messages, use_openai=True)
+
+        # 工具执行后持久化大结果（Layer 1）
         result = ctx.persist_if_large("read_file", raw_result)
-        
+
         # API 调用后更新 token 统计
         ctx.counter.record_usage(input_tokens, output_tokens)
-        
-        # 轮次边界检查是否需要 auto-compact
+
+        # 轮次边界检查是否需要 auto-compact（Layer 5）
         if ctx.should_auto_compact():
             messages = await ctx.do_compact(...)
     """
@@ -874,14 +874,14 @@ class ContextManager:
     def effective_window(self) -> int:
         return get_effective_window(self.model)
 
-    # ─── Layer 0.5 ─────────────────────────────────
+    # ─── Layer 1 ─────────────────────────────────
 
     @staticmethod
     def persist_if_large(tool_name: str, result: str) -> str:
-        """持久化超大工具结果（Layer 0.5）"""
+        """持久化超大工具结果（Layer 1: 大结果存磁盘）"""
         return persist_large_result(tool_name, result)
 
-    # ─── Layer 1+2+2.5+4 (pre-call pipeline) ─────────
+    # ─── Layer 2+3+4 (pre-call pipeline) ─────────
 
     def run_pre_call_pipeline(
         self,
@@ -890,17 +890,17 @@ class ContextManager:
     ) -> list[dict[str, Any]]:
         """每次 API 调用前执行压缩管道，返回应传给 API 的消息列表。
 
-        Context Collapse 设计（参考 Claude Code L4）：
-        - 低利用率（<50%）：零拷贝，直接返回原始 messages
-        - 中利用率（50%-90%）：深拷贝 → Budget → Snip → Microcompact，返回副本
-        - 高利用率（>=90%）：深拷贝 → Budget → Snip → Microcompact → Context Collapse，返回副本
+        参考 Claude Code 5 层金字塔（Layer 2-4 在 pre-call 执行，零 API 成本）：
+        - 低利用率（<60%）：零拷贝，直接返回原始 messages
+        - 中利用率（60%-90%）：深拷贝 → Snip → Microcompact，返回副本
+        - 高利用率（>=90%）：深拷贝 → Snip → Microcompact → Context Collapse，返回副本
 
-        原始 messages 永不被修改，只有 Auto-Compact（Layer 3）才是破坏性操作。
+        原始 messages 永不被修改，只有 Auto-Compact（Layer 5）才是破坏性操作。
         """
         utilization = self.counter.effective_utilization(self.model)
 
         # 低利用率：不需要压缩，直接返回原始消息（零拷贝）
-        if utilization < BUDGET_THRESHOLD_1:
+        if utilization < SNIP_UTILIZATION_THRESHOLD:
             return messages
 
         # Context Collapse：深拷贝后在副本上压缩，不破坏原始消息
@@ -908,14 +908,14 @@ class ContextManager:
         collapsed = copy.deepcopy(messages)
 
         if use_openai:
-            apply_budget_openai(collapsed, utilization)
+            # Layer 2: Snip — 清空过时 tool_result content，保留 tool_use 元数据
             apply_snip_openai(collapsed, utilization)
+            # Layer 3: Micro-Compact — 60min 未活动时清空可重新获取的工具结果
             apply_microcompact_openai(collapsed, self.counter.last_api_call_time)
-            # Layer 4: 高利用率时应用更激进的压缩
+            # Layer 4: Context Collapse — 90% 时更激进的压缩
             if utilization >= COLLAPSE_UTILIZATION_THRESHOLD:
                 apply_context_collapse_openai(collapsed, utilization)
         else:
-            apply_budget_anthropic(collapsed, utilization)
             apply_snip_anthropic(collapsed, utilization)
             apply_microcompact_anthropic(collapsed, self.counter.last_api_call_time)
             if utilization >= COLLAPSE_UTILIZATION_THRESHOLD:
@@ -923,13 +923,19 @@ class ContextManager:
 
         return collapsed
 
-    # ─── Layer 3 (turn boundary) ──────────────────
+    # ─── Layer 5 (turn boundary) ─────────────────
 
     def should_auto_compact(self) -> bool:
-        """判断是否应该触发自动压缩"""
+        """判断是否应该触发自动压缩。
+
+        参考 Claude Code：用绝对缓冲而非百分比。
+        触发条件：估算 token 数 >= 上下文窗口 - AUTOCOMPACT_TOTAL_BUFFER（~33K）
+        其中 33K = 20K（摘要输出预留）+ 13K（安全缓冲）
+        """
         if self._compact_failure_count >= self._max_compact_failures:
             return False  # 熔断
-        return self.counter.effective_utilization(self.model) >= COMPACT_UTILIZATION_THRESHOLD
+        threshold = get_context_window(self.model) - AUTOCOMPACT_TOTAL_BUFFER
+        return self.counter.estimate_current_input() >= threshold
 
     async def do_compact_openai(
         self,
