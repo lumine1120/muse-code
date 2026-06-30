@@ -267,14 +267,16 @@ class Agent:
         task = asyncio.create_task(sub_agent.run_once(prompt))
 
         try:
-            # 带超时等待
-            result = await asyncio.wait_for(task, timeout=self.sub_agent_timeout)
+            # 带超时等待。用 asyncio.shield 把 task 屏蔽起来——否则 wait_for 超时时
+            # 会顺手 cancel 掉传入的 awaitable，所谓"转后台"会变成"被取消"，
+            # 永远不会再产出结果。shield 保证只取消外层等待，task 本体继续在后台跑。
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=self.sub_agent_timeout)
             # token 汇总到父 Agent
             self._record_tokens(result["tokens"]["input"], result["tokens"]["output"])
             self.ui.print_sub_agent_end(agent_type)
             return result["text"] or "(Sub-agent produced no output)"
         except asyncio.TimeoutError:
-            # 超时：转后台，不取消 task
+            # 超时：task 因 shield 仍在后台运行，登记到注册表等下次轮询消费
             self._bg_task_counter += 1
             task_id = f"agent-{self._bg_task_counter:03d}"
             self._background_tasks[task_id] = {
@@ -578,7 +580,8 @@ class Agent:
                 return
             prev_len = len(self._openai_messages)
             self._openai_messages = await self._context.do_compact_openai(
-                self._openai_messages, self._openai_client, self._read_file_state
+                self._openai_messages, self._openai_client, self._read_file_state,
+                self._background_tasks,
             )
             after_len = len(self._openai_messages)
         else:
@@ -587,7 +590,8 @@ class Agent:
                 return
             prev_len = len(self._anthropic_messages)
             self._anthropic_messages = await self._context.do_compact_anthropic(
-                self._anthropic_messages, self._anthropic_client, self._system_prompt, self._read_file_state
+                self._anthropic_messages, self._anthropic_client, self._system_prompt,
+                self._read_file_state, self._background_tasks,
             )
             after_len = len(self._anthropic_messages)
         
@@ -744,7 +748,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if self._context.should_auto_compact():
             self.ui.print_system("上下文窗口即将填满，正在压缩对话...")
             self._anthropic_messages = await self._context.do_compact_anthropic(
-                self._anthropic_messages, self._anthropic_client, self._system_prompt, self._read_file_state
+                self._anthropic_messages, self._anthropic_client, self._system_prompt,
+                self._read_file_state, self._background_tasks,
             )
 
         # 1. 把用户消息加入上下文
@@ -952,7 +957,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if self._context.should_auto_compact():
             self.ui.print_system("上下文窗口即将填满，正在压缩对话...")
             self._openai_messages = await self._context.do_compact_openai(
-                self._openai_messages, self._openai_client, self._read_file_state
+                self._openai_messages, self._openai_client, self._read_file_state,
+                self._background_tasks,
             )
 
         # 1. 用户消息加入上下文
@@ -1114,7 +1120,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             ))
         self.ui.print_confirmation(perm.message, danger_level)
 
-        # 优先使用外部回调（如测试或 GUIsd
+        # 优先使用外部回调（如测试或 GUI）
         if self.confirm_fn:
             return await self.confirm_fn(perm.message)
 
@@ -1326,11 +1332,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self.ui.print_system("上下文窗口即将填满，正在压缩对话...")
             if self.use_openai:
                 self._openai_messages = await self._context.do_compact_openai(
-                    self._openai_messages, self._openai_client, self._read_file_state
+                    self._openai_messages, self._openai_client, self._read_file_state,
+                    self._background_tasks,
                 )
             else:
                 self._anthropic_messages = await self._context.do_compact_anthropic(
-                    self._anthropic_messages, self._anthropic_client, self._system_prompt, self._read_file_state
+                    self._anthropic_messages, self._anthropic_client, self._system_prompt,
+                    self._read_file_state, self._background_tasks,
                 )
 
         # 用户消息加入上下文

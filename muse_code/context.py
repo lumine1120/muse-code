@@ -563,6 +563,51 @@ def restore_recent_files(
     return "[Recently read files restored after compact]\n\n" + "\n\n".join(parts)
 
 
+# ─── 状态信息附件：后台子 Agent 运行态 ─────────────────────
+# 与 restore_recent_files 同性质，都属于"状态信息走附件通道"：
+# 摘要是有损语义压缩，保不住"还有 N 个后台任务在跑"这种运行时事实，
+# 必须以结构化清单的形式重新贴回新对话开头，否则 compact 之后突然
+# 蹦出 <task-notification task-id="agent-001"> 时，模型不知道 agent-001
+# 是怎么来的，会困惑。
+
+
+def format_background_tasks_snapshot(background_tasks: dict[str, dict] | None) -> str:
+    """把当前活跃的后台子 Agent 渲染成一段"运行态快照"附件。
+
+    入参 background_tasks 与 Agent._background_tasks 同结构：
+        {task_id: {"task": asyncio.Task, "agent_type": str,
+                   "description": str, "start_time": float, ...}}
+
+    设计上故意不依赖 Agent 类型（保持 context 模块的无状态性），
+    只读取需要展示的字段；task 对象只用 .done() 探测状态，绝不取消或等待。
+    """
+    if not background_tasks:
+        return ""
+
+    lines: list[str] = []
+    now = time.time()
+    for task_id, entry in background_tasks.items():
+        task = entry.get("task")
+        if task is not None and task.done():
+            status = "completed (notification pending)"
+        else:
+            status = "running"
+        elapsed = int(now - entry.get("start_time", now))
+        agent_type = entry.get("agent_type", "unknown")
+        description = entry.get("description", "")
+        lines.append(
+            f"- task-id={task_id} type={agent_type} status={status} "
+            f"elapsed={elapsed}s — {description}"
+        )
+
+    return (
+        "[Background sub-agents still tracked after compact]\n"
+        "These tasks were spawned before compaction and continue to run. "
+        "When each finishes, a <task-notification> will be injected as a user message.\n\n"
+        + "\n".join(lines)
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
 # Layer 4: Context Collapse — 读时投影，不破坏原始消息
 # ═══════════════════════════════════════════════════════════════
@@ -666,13 +711,18 @@ async def compact_openai(
     client: Any,
     model: str,
     read_file_state: dict[str, float] | None = None,
+    background_tasks: dict[str, dict] | None = None,
 ) -> list[dict[str, Any]]:
     """压缩 OpenAI 格式对话历史（Layer 5: Auto-Compact）。
 
-    参考 Claude Code：
+    参考 Claude Code 并扩展状态信息分通道：
     1. Microcompact 预处理：先清空大体积工具结果，减轻摘要器负担
-    2. 全量送进 LLM 生成 9 部分结构化摘要
-    3. buildPostCompactMessages 重组：[边界标记] + [摘要] + [附件（恢复文件）] + [最后一条 user 消息]
+    2. 全量送进 LLM 生成 9 部分结构化摘要（语义信息通道）
+    3. buildPostCompactMessages 重组：
+       [边界标记] + [摘要] + [状态附件: 文件原文 + 后台任务清单] + [最后一条 user 消息]
+
+    background_tasks 走"状态信息附件通道"——摘要是有损的，留不住"有 N 个
+    后台子 Agent 在跑"这种运行时事实，必须以结构化清单形式重新贴回。
     """
     if len(messages) < 5:
         return messages
@@ -720,12 +770,18 @@ async def compact_openai(
         {"role": "user", "content": COMPACT_ASSISTANT_RESPONSE},
     ]
 
-    # 附件：文件恢复（压缩后按最近活跃度恢复关键文件）
+    # 附件 1：文件恢复（按最近活跃度恢复关键文件原文）
     if read_file_state:
         restored = restore_recent_files(read_file_state)
         if restored:
             new_messages.append({"role": "assistant", "content": restored})
             new_messages.append({"role": "user", "content": "Understood. I have the restored file context. Continuing..."})
+
+    # 附件 2：后台子 Agent 运行态快照（状态信息附件通道）
+    bg_snapshot = format_background_tasks_snapshot(background_tasks)
+    if bg_snapshot:
+        new_messages.append({"role": "assistant", "content": bg_snapshot})
+        new_messages.append({"role": "user", "content": "Understood. I'm aware of the background sub-agents and will handle their notifications when they arrive."})
 
     # 最后一条 user 消息
     if last_msg.get("role") == "user":
@@ -740,6 +796,7 @@ async def compact_anthropic(
     model: str,
     system_prompt: str,
     read_file_state: dict[str, float] | None = None,
+    background_tasks: dict[str, dict] | None = None,
 ) -> list[dict[str, Any]]:
     """压缩 Anthropic 格式对话历史（Layer 5: Auto-Compact）。
 
@@ -792,12 +849,18 @@ async def compact_anthropic(
         {"role": "user", "content": COMPACT_ASSISTANT_RESPONSE},
     ]
 
-    # 附件：文件恢复
+    # 附件 1：文件恢复
     if read_file_state:
         restored = restore_recent_files(read_file_state)
         if restored:
             new_messages.append({"role": "assistant", "content": restored})
             new_messages.append({"role": "user", "content": "Understood. I have the restored file context. Continuing..."})
+
+    # 附件 2：后台子 Agent 运行态快照（状态信息附件通道）
+    bg_snapshot = format_background_tasks_snapshot(background_tasks)
+    if bg_snapshot:
+        new_messages.append({"role": "assistant", "content": bg_snapshot})
+        new_messages.append({"role": "user", "content": "Understood. I'm aware of the background sub-agents and will handle their notifications when they arrive."})
 
     # 最后一条 user 消息
     if last_msg.get("role") == "user":
@@ -942,10 +1005,13 @@ class ContextManager:
         messages: list[dict[str, Any]],
         client: Any,
         read_file_state: dict[str, float] | None = None,
+        background_tasks: dict[str, dict] | None = None,
     ) -> list[dict[str, Any]]:
-        """执行 OpenAI 后端的全量压缩（含文件恢复）"""
+        """执行 OpenAI 后端的全量压缩（含文件恢复 + 后台任务运行态快照）"""
         try:
-            result = await compact_openai(messages, client, self.model, read_file_state)
+            result = await compact_openai(
+                messages, client, self.model, read_file_state, background_tasks,
+            )
             self.counter.last_input_tokens = 0
             self._compact_failure_count = 0
             return result
@@ -959,10 +1025,13 @@ class ContextManager:
         client: Any,
         system_prompt: str,
         read_file_state: dict[str, float] | None = None,
+        background_tasks: dict[str, dict] | None = None,
     ) -> list[dict[str, Any]]:
-        """执行 Anthropic 后端的全量压缩（含文件恢复）"""
+        """执行 Anthropic 后端的全量压缩（含文件恢复 + 后台任务运行态快照）"""
         try:
-            result = await compact_anthropic(messages, client, self.model, system_prompt, read_file_state)
+            result = await compact_anthropic(
+                messages, client, self.model, system_prompt, read_file_state, background_tasks,
+            )
             self.counter.last_input_tokens = 0
             self._compact_failure_count = 0
             return result

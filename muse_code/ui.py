@@ -71,7 +71,7 @@ class UI:
         self.console.print(Panel.fit(
             "[bold blue]Welcome to Muse Code[/bold blue]\n"
             "输入消息开始对话，输入 exit 退出\n"
-            "命令: /clear /cost /compact /plan /whitelist",
+            "命令: /clear /cost /compact /plan /whitelist /memory /skills",
             border_style="blue"
         ))
 

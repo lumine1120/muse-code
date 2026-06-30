@@ -1,6 +1,6 @@
-"""工具定义与执行 — 10 个工具与 5 种权限模式。
+"""工具定义与执行 — 12 个工具与 5 种权限模式。
 模拟 Claude Code 的工具系统： read_file, write_file, edit_file, list_files,
-grep_search, run_shell, skill, enter/exit_plan_mode, agent.
+grep_search, run_shell, skill, web_fetch, enter/exit_plan_mode, agent, tool_search。
 
 权限与安全检查已提取到 muse_code.permissions 模块。
 """

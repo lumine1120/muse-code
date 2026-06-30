@@ -151,7 +151,13 @@ def get_sub_agent_config(agent_type: str) -> dict:
     custom = _discover_custom_agents().get(agent_type)
     if custom:
         if custom["allowed_tools"]:
-            tools = [t for t in tool_definitions if t["name"] in custom["allowed_tools"]]
+            # 即使用户显式声明 allowed-tools，也强制剔除 agent 工具——
+            # 子 Agent 递归派生子 Agent 会让 Token 呈指数级增长，
+            # 这是系统级硬约束，不允许通过用户配置绕过。
+            tools = [
+                t for t in tool_definitions
+                if t["name"] in custom["allowed_tools"] and t["name"] != "agent"
+            ]
         else:
             # 未声明 allowed-tools：给全量工具但禁止递归派生子 Agent
             tools = [t for t in tool_definitions if t["name"] != "agent"]
